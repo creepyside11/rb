@@ -1,4 +1,4 @@
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
 
 from sqlalchemy import select
 
@@ -12,6 +12,14 @@ PACKAGES = {
     100: 100_000_000,
     500: 500_000_000,
 }
+TOKENS_PER_RUBLE = 1_000_000
+MIN_TOKEN_AMOUNT = 1_000_000
+MAX_TOKEN_AMOUNT = 1_000_000_000_000
+
+
+def tokens_to_rubles(token_amount: int) -> Decimal:
+    """Round the price up to one kopeck so an invoice never undercharges."""
+    return (Decimal(token_amount) / TOKENS_PER_RUBLE).quantize(Decimal("0.01"), rounding=ROUND_UP)
 
 
 def bind_purchase_link(session, token: str, telegram_user_id: int):
@@ -37,7 +45,15 @@ def get_bound_link(session, telegram_user_id: int):
     ).scalar_one_or_none()
 
 
-def save_pending_payment(session, link: PurchaseLink, telegram_user_id: int, rub_amount: int, payload: str, invoice: dict):
+def save_pending_payment(
+    session,
+    link: PurchaseLink,
+    telegram_user_id: int,
+    rub_amount: Decimal,
+    token_amount: int,
+    payload: str,
+    invoice: dict,
+):
     payment = TokenPayment(
         user_id=link.user_id,
         purchase_link_id=link.id,
@@ -45,7 +61,7 @@ def save_pending_payment(session, link: PurchaseLink, telegram_user_id: int, rub
         invoice_id=int(invoice["invoice_id"]),
         payload=payload,
         rub_amount=Decimal(rub_amount),
-        token_amount=PACKAGES[rub_amount],
+        token_amount=token_amount,
         status="pending",
     )
     session.add(payment)

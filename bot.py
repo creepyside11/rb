@@ -26,6 +26,7 @@ from payments import (
     bind_purchase_link,
     credit_verified_payment,
     get_bound_link,
+    get_pending_payments,
     save_pending_payment,
     tokens_to_rubles,
 )
@@ -295,15 +296,27 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
         invoice = await crypto.get_invoice(invoice_id)
     except CryptoPayError as error:
         logger.warning("Crypto Pay getInvoices failed for %s: %s", invoice_id, error)
-        await callback.message.answer("⚠️ Crypto Bot пока не отвечает. Попробуйте проверить ещё раз.")
+        await callback.message.answer(
+            f"⚠️ Crypto Bot пока не ответил. Автопроверка продолжает работать.\n"
+            f"Код: <code>{html.escape(error.code)}</code>"
+        )
+        return
+    except Exception:
+        logger.exception("Unexpected manual payment check failure for invoice %s", invoice_id)
+        await callback.message.answer("⚠️ Не удалось проверить сейчас. Автопроверка повторит попытку через 5 секунд.")
         return
     if invoice is None:
         await callback.message.answer("❌ Счёт не найден в Crypto Bot.")
         return
-    with session_factory() as session:
-        result, payment = credit_verified_payment(session, payment_id, invoice)
-        user = session.get(User, payment.user_id) if payment else None
-        current_balance = user.token_balance if user else 0
+    try:
+        with session_factory() as session:
+            result, payment = credit_verified_payment(session, payment_id, invoice)
+            user = session.get(User, payment.user_id) if payment else None
+            current_balance = user.token_balance if user else 0
+    except SQLAlchemyError:
+        logger.exception("Database failure while crediting payment %s", payment_id)
+        await callback.message.answer("⚠️ База временно недоступна. Автопроверка повторит начисление.")
+        return
     if result == "credited":
         await callback.message.answer(
             f"✅ <b>Оплата подтверждена!</b>\n"
@@ -319,6 +332,74 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
     else:
         logger.warning("Invoice verification mismatch for payment %s", payment_id)
         await callback.message.answer("⚠️ Данные счёта не совпали. Баланс не изменён.")
+
+
+def load_pending_payments(session_factory):
+    with session_factory() as session:
+        return get_pending_payments(session)
+
+
+def credit_automatic_payment(session_factory, payment_id: int, invoice: dict):
+    with session_factory() as session:
+        result, payment = credit_verified_payment(session, payment_id, invoice)
+        user = session.get(User, payment.user_id) if payment else None
+        balance = user.token_balance if user else 0
+        return result, payment, balance
+
+
+async def reconcile_pending_payments(bot: Bot, session_factory, crypto: CryptoPayClient) -> None:
+    """Verify pending invoices in batches and credit them without a button click."""
+    pending = await asyncio.to_thread(load_pending_payments, session_factory)
+    if not pending:
+        return
+    invoice_by_id = {
+        int(invoice.get("invoice_id", 0)): invoice
+        for invoice in await crypto.get_invoices([payment.invoice_id for payment in pending])
+    }
+    for pending_payment in pending:
+        invoice = invoice_by_id.get(pending_payment.invoice_id)
+        if invoice is None or invoice.get("status") != "paid":
+            continue
+        result, payment, balance = await asyncio.to_thread(
+            credit_automatic_payment,
+            session_factory,
+            pending_payment.id,
+            invoice,
+        )
+        if result != "credited" or payment is None:
+            continue
+        logger.info("Automatically credited payment_id=%s invoice_id=%s", payment.id, payment.invoice_id)
+        try:
+            await bot.send_message(
+                payment.telegram_user_id,
+                "✅ <b>Оплата подтверждена автоматически!</b>\n"
+                f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+            )
+        except Exception:
+            # The balance is already committed; a Telegram delivery failure must not roll it back.
+            logger.exception("Could not notify Telegram user for payment %s", payment.id)
+
+
+async def payment_reconciliation_loop(
+    bot: Bot,
+    session_factory,
+    crypto: CryptoPayClient,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            await reconcile_pending_payments(bot, session_factory, crypto)
+        except CryptoPayError as error:
+            logger.warning("Automatic Crypto Pay check failed: %s", error)
+        except SQLAlchemyError:
+            logger.exception("Automatic payment database check failed")
+        except Exception:
+            logger.exception("Unexpected automatic payment check failure")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def handle_error(event: ErrorEvent):
@@ -359,6 +440,11 @@ async def main():
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     dispatcher.errors.register(handle_error)
+    stop_reconciliation = asyncio.Event()
+    reconciliation_task = asyncio.create_task(
+        payment_reconciliation_loop(bot, session_factory, crypto, stop_reconciliation),
+        name="crypto-pay-reconciliation",
+    )
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(
@@ -369,6 +455,8 @@ async def main():
             close_bot_session=False,
         )
     finally:
+        stop_reconciliation.set()
+        await reconciliation_task
         await crypto.close()
         await bot.session.close()
         engine.dispose()

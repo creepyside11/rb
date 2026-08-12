@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import Base, PurchaseLink, TokenPayment, User
+from cryptopay import CryptoPayClient, CryptoPayError
 from payments import bind_purchase_link, credit_verified_payment, tokens_to_rubles
 
 
@@ -29,6 +30,14 @@ class PaymentTest(unittest.TestCase):
     def test_custom_token_amount_is_converted_at_one_million_per_ruble(self):
         self.assertEqual(tokens_to_rubles(25_000_000), Decimal("25.00"))
         self.assertEqual(tokens_to_rubles(1_000_001), Decimal("1.01"))
+
+    def test_get_invoices_accepts_documented_and_wrapped_responses(self):
+        invoice = {"invoice_id": 77, "status": "paid"}
+        self.assertEqual(CryptoPayClient._normalize_invoices([invoice]), [invoice])
+        self.assertEqual(CryptoPayClient._normalize_invoices({"items": [invoice]}), [invoice])
+        self.assertEqual(CryptoPayClient._normalize_invoices(invoice), [invoice])
+        with self.assertRaises(CryptoPayError):
+            CryptoPayClient._normalize_invoices({"unexpected": []})
 
     def test_paid_invoice_is_credited_exactly_once(self):
         with self.Session() as session:

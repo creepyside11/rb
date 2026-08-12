@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import Base, PurchaseLink, TokenPayment, User
-from payments import bind_purchase_link, credit_verified_payment
+from payments import bind_purchase_link, credit_verified_payment, tokens_to_rubles
 
 
 class PaymentTest(unittest.TestCase):
@@ -25,6 +25,10 @@ class PaymentTest(unittest.TestCase):
             stolen, _ = bind_purchase_link(session, "x" * 32, 202)
         self.assertEqual(result, "ok")
         self.assertEqual(stolen, "claimed")
+
+    def test_custom_token_amount_is_converted_at_one_million_per_ruble(self):
+        self.assertEqual(tokens_to_rubles(25_000_000), Decimal("25.00"))
+        self.assertEqual(tokens_to_rubles(1_000_001), Decimal("1.01"))
 
     def test_paid_invoice_is_credited_exactly_once(self):
         with self.Session() as session:

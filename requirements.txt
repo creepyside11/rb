@@ -1,4 +1,4 @@
-aiogram>=3.29,<4
+aiogram>=3.30,<4
 SQLAlchemy>=2.0,<3
 psycopg[binary]>=3.2,<4
 python-dotenv>=1.0,<2

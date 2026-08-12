@@ -4,6 +4,8 @@ Telegram worker for `@emeraldairobot`, built on aiogram 3. It accepts only perso
 
 Users can select a ready-made package or enter an exact token amount. The rate is 1,000,000 tokens per ₽1; fractional prices are rounded up to one kopeck and shown before invoice creation.
 
+Pending invoices are reconciled with Crypto Pay every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation; the manual check button remains as an immediate fallback.
+
 ## Environment
 
 Set these variables on the bot hosting:

@@ -23,7 +23,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-The process is a long-running Telegram polling worker, not a web service. On platforms with process types use the included `Procfile`; Docker hosting can use the included `Dockerfile`.
+The process is a long-running Telegram polling worker, not a web service. Run exactly one replica, because two polling instances with the same bot token conflict. On platforms with process types use the included `Procfile`; Docker hosting can use the included `Dockerfile`.
 
 ## Payment safety
 

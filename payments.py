@@ -45,6 +45,15 @@ def get_bound_link(session, telegram_user_id: int):
     ).scalar_one_or_none()
 
 
+def get_pending_payments(session, limit: int = 100):
+    return list(session.execute(
+        select(TokenPayment)
+        .where(TokenPayment.status == "pending")
+        .order_by(TokenPayment.created_at.desc())
+        .limit(limit)
+    ).scalars())
+
+
 def save_pending_payment(
     session,
     link: PurchaseLink,

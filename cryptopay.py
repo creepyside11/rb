@@ -74,8 +74,30 @@ class CryptoPayClient:
             },
         )
 
+    @staticmethod
+    def _normalize_invoices(result) -> list[dict]:
+        """Accept the documented array and the wrapped `items` response used by some API versions."""
+        if isinstance(result, list):
+            invoices = result
+        elif isinstance(result, dict) and isinstance(result.get("items"), list):
+            invoices = result["items"]
+        elif isinstance(result, dict) and "invoice_id" in result:
+            invoices = [result]
+        else:
+            raise CryptoPayError("INVALID_GET_INVOICES_RESPONSE")
+        return [invoice for invoice in invoices if isinstance(invoice, dict)]
+
+    async def get_invoices(self, invoice_ids: list[int]) -> list[dict]:
+        if not invoice_ids:
+            return []
+        result = await self._request(
+            "getInvoices",
+            {"invoice_ids": ",".join(str(invoice_id) for invoice_id in invoice_ids), "count": len(invoice_ids)},
+        )
+        return self._normalize_invoices(result)
+
     async def get_invoice(self, invoice_id: int) -> dict | None:
-        invoices = await self._request("getInvoices", {"invoice_ids": str(invoice_id), "count": 1}) or []
+        invoices = await self.get_invoices([invoice_id])
         return next((item for item in invoices if int(item.get("invoice_id", 0)) == invoice_id), None)
 
 

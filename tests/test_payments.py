@@ -4,9 +4,17 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import Base, PurchaseLink, TokenPayment, User
+from database import Base, ManualPayment, PurchaseLink, TokenPayment, User
 from cryptopay import CryptoPayClient, CryptoPayError
-from payments import bind_purchase_link, credit_verified_payment, tokens_to_rubles
+from payments import (
+    admin_statistics,
+    bind_purchase_link,
+    create_manual_payment,
+    credit_verified_payment,
+    review_manual_payment,
+    submit_manual_receipt,
+    tokens_to_rubles,
+)
 
 
 class PaymentTest(unittest.TestCase):
@@ -15,7 +23,7 @@ class PaymentTest(unittest.TestCase):
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         with self.Session() as session:
-            session.add(User(id=1, token_balance=5_000_000))
+            session.add(User(id=1, name="Test", email="test@example.com", token_balance=5_000_000))
             session.add(PurchaseLink(id=1, user_id=1, token="x" * 32, is_active=True))
             session.commit()
 
@@ -98,6 +106,55 @@ class PaymentTest(unittest.TestCase):
             balance = session.get(User, 1).token_balance
         self.assertEqual(result, "invalid")
         self.assertEqual(balance, 5_000_000)
+
+    def test_sbp_receipt_is_approved_and_credited_exactly_once(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            payment = create_manual_payment(session, link, 101, Decimal("25.00"), 25_000_000)
+            payment_id = payment.id
+        with self.Session() as session:
+            result, _ = submit_manual_receipt(session, payment_id, 101, "receipt-file", "photo")
+        with self.Session() as session:
+            approved, _, first_balance = review_manual_payment(session, payment_id, 7973988177, True)
+        with self.Session() as session:
+            repeated, _, second_balance = review_manual_payment(session, payment_id, 7973988177, True)
+            stored = session.get(ManualPayment, payment_id)
+        self.assertEqual(result, "submitted")
+        self.assertEqual(approved, "approved")
+        self.assertEqual(repeated, "already_approved")
+        self.assertEqual(first_balance, 30_000_000)
+        self.assertEqual(second_balance, 30_000_000)
+        self.assertEqual(stored.status, "approved")
+
+    def test_rejected_sbp_receipt_never_credits_balance(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            payment = create_manual_payment(session, link, 101, Decimal("10.00"), 10_000_000)
+            payment_id = payment.id
+            submit_manual_receipt(session, payment_id, 101, "receipt-file", "document")
+        with self.Session() as session:
+            result, _, balance = review_manual_payment(session, payment_id, 7973988177, False)
+        with self.Session() as session:
+            repeated, _, _ = review_manual_payment(session, payment_id, 7973988177, True)
+            user_balance = session.get(User, 1).token_balance
+        self.assertEqual(result, "rejected")
+        self.assertIsNone(balance)
+        self.assertEqual(repeated, "already_rejected")
+        self.assertEqual(user_balance, 5_000_000)
+
+    def test_admin_statistics_combine_crypto_and_sbp(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            link.telegram_user_id = 101
+            payment = create_manual_payment(session, link, 101, Decimal("5.00"), 5_000_000)
+            submit_manual_receipt(session, payment.id, 101, "receipt", "photo")
+            review_manual_payment(session, payment.id, 7973988177, True)
+        with self.Session() as session:
+            stats = admin_statistics(session)
+        self.assertEqual(stats["users"], 1)
+        self.assertEqual(stats["linked"], 1)
+        self.assertEqual(stats["sbp_paid"], 1)
+        self.assertEqual(stats["sbp_rub"], Decimal("5.00"))
 
 
 if __name__ == "__main__":

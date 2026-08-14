@@ -18,16 +18,24 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
 from cryptopay import CryptoPayClient, CryptoPayError, invoice_payment_url
-from database import Base, TokenPayment, User, database_from_environment
+from database import Base, ManualPayment, TokenPayment, User, database_from_environment
 from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
     PACKAGES,
+    admin_statistics,
+    admin_users,
+    attach_admin_message,
     bind_purchase_link,
+    broadcast_recipients,
     credit_verified_payment,
+    create_manual_payment,
     get_bound_link,
     get_pending_payments,
+    recent_manual_payments,
+    review_manual_payment,
     save_pending_payment,
+    submit_manual_receipt,
     tokens_to_rubles,
 )
 
@@ -36,10 +44,21 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 logger = logging.getLogger("emerald-payment-bot")
 router = Router(name="emerald-payments")
 LINK_PATTERN = re.compile(r"^buy_([A-Za-z0-9_-]{30,48})$")
+DEFAULT_ADMIN_ID = 7973988177
+SBP_PHONE = "+79818376180"
+SBP_BANK = "ЮMoney"
+SBP_RECIPIENT = "Иван Б."
 
 
 class PurchaseState(StatesGroup):
     waiting_for_token_amount = State()
+    choosing_payment_method = State()
+    waiting_for_receipt = State()
+
+
+class AdminState(StatesGroup):
+    waiting_for_broadcast = State()
+    confirming_broadcast = State()
 
 
 def format_tokens(value: int) -> str:
@@ -61,6 +80,39 @@ def package_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="✍️ Ввести своё количество", callback_data="buy:custom")])
     rows.append([InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_method_keyboard(crypto_available: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+    if crypto_available:
+        rows.append([InlineKeyboardButton(text="💎 Crypto Bot · автоматически", callback_data="method:crypto")])
+    rows.append([InlineKeyboardButton(text="🏦 СБП · по чеку", callback_data="method:sbp")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Платежи СБП", callback_data="admin:payments"),
+            InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast"),
+        ],
+    ])
+
+
+def receipt_review_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"receipt:approve:{payment_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"receipt:reject:{payment_id}"),
+    ]])
+
+
+def is_admin(telegram_user_id: int, admin_id: int) -> bool:
+    return telegram_user_id == admin_id
 
 
 def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
@@ -188,8 +240,11 @@ async def issue_invoice(
     token_amount: int,
     rub_amount: Decimal,
     session_factory,
-    crypto: CryptoPayClient,
+    crypto: CryptoPayClient | None,
 ):
+    if crypto is None:
+        await message.answer("⚠️ Crypto Bot сейчас недоступен. Выберите оплату по СБП.")
+        return
     with session_factory() as session:
         link = get_bound_link(session, telegram_user_id)
     if link is None:
@@ -232,8 +287,24 @@ async def issue_invoice(
     )
 
 
+async def offer_payment_methods(
+    message: Message,
+    state: FSMContext,
+    token_amount: int,
+    rub_amount: Decimal,
+    crypto: CryptoPayClient | None,
+):
+    await state.set_state(PurchaseState.choosing_payment_method)
+    await state.update_data(token_amount=token_amount, rub_amount=str(rub_amount))
+    await message.answer(
+        f"💎 <b>{format_tokens(token_amount)}</b> токенов · <b>{format_rubles(rub_amount)} ₽</b>\n\n"
+        "Выберите способ оплаты:",
+        reply_markup=payment_method_keyboard(crypto is not None),
+    )
+
+
 @router.callback_query(F.data.startswith("buy:"))
-async def create_package_invoice(callback: CallbackQuery, state: FSMContext, session_factory, crypto: CryptoPayClient):
+async def create_package_invoice(callback: CallbackQuery, state: FSMContext, session_factory, crypto: CryptoPayClient | None):
     if callback.data == "buy:custom":
         return
     try:
@@ -242,21 +313,19 @@ async def create_package_invoice(callback: CallbackQuery, state: FSMContext, ses
     except (ValueError, IndexError, KeyError, AttributeError):
         await callback.answer("❌ Некорректный пакет", show_alert=True)
         return
-    await callback.answer("⏳ Создаю счёт…")
-    await state.clear()
+    await callback.answer()
     if callback.message:
-        await issue_invoice(
+        await offer_payment_methods(
             callback.message,
-            callback.from_user.id,
+            state,
             token_amount,
             Decimal(rubles),
-            session_factory,
             crypto,
         )
 
 
 @router.message(PurchaseState.waiting_for_token_amount)
-async def create_custom_invoice(message: Message, state: FSMContext, session_factory, crypto: CryptoPayClient):
+async def create_custom_invoice(message: Message, state: FSMContext, session_factory, crypto: CryptoPayClient | None):
     raw_value = (message.text or "").strip()
     if not re.fullmatch(r"[0-9 _]+", raw_value):
         await message.answer("⚠️ Введите целое число, например: <code>25000000</code>")
@@ -269,15 +338,379 @@ async def create_custom_invoice(message: Message, state: FSMContext, session_fac
         await message.answer(f"⚠️ Максимум — <b>{format_tokens(MAX_TOKEN_AMOUNT)}</b> токенов.")
         return
     rub_amount = tokens_to_rubles(token_amount)
-    await state.clear()
     await message.answer(
         f"🧮 Рассчитано: <b>{format_tokens(token_amount)}</b> токенов = <b>{format_rubles(rub_amount)} ₽</b>"
     )
-    await issue_invoice(message, message.from_user.id, token_amount, rub_amount, session_factory, crypto)
+    await offer_payment_methods(message, state, token_amount, rub_amount, crypto)
+
+
+@router.callback_query(PurchaseState.choosing_payment_method, F.data.startswith("method:"))
+async def choose_payment_method(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    crypto: CryptoPayClient | None,
+):
+    data = await state.get_data()
+    try:
+        token_amount = int(data["token_amount"])
+        rub_amount = Decimal(data["rub_amount"])
+    except (KeyError, ValueError):
+        await state.clear()
+        await callback.answer("Сумма устарела. Выберите пакет заново.", show_alert=True)
+        return
+    if callback.message is None:
+        return
+
+    method = callback.data.split(":", 1)[1]
+    if method == "crypto":
+        await callback.answer("⏳ Создаю счёт…")
+        await state.clear()
+        await issue_invoice(
+            callback.message,
+            callback.from_user.id,
+            token_amount,
+            rub_amount,
+            session_factory,
+            crypto,
+        )
+        return
+    if method != "sbp":
+        await callback.answer("Неизвестный способ оплаты", show_alert=True)
+        return
+
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        if link is None:
+            await state.clear()
+            await callback.answer("Сначала откройте покупку с сайта", show_alert=True)
+            return
+        payment = create_manual_payment(
+            session,
+            link,
+            callback.from_user.id,
+            rub_amount,
+            token_amount,
+        )
+    await callback.answer()
+    await state.set_state(PurchaseState.waiting_for_receipt)
+    await state.update_data(manual_payment_id=payment.id)
+    await callback.message.answer(
+        "🏦 <b>Оплата по СБП</b>\n\n"
+        f"💵 Сумма: <b>{format_rubles(rub_amount)} ₽</b>\n"
+        f"📱 Номер: <code>{SBP_PHONE}</code>\n"
+        f"🏛 Банк: <b>{SBP_BANK}</b>\n"
+        f"👤 Получатель: <b>{SBP_RECIPIENT}</b>\n\n"
+        f"💎 После подтверждения будет начислено: <b>{format_tokens(token_amount)}</b> токенов.\n\n"
+        "После успешной оплаты отправьте сюда <b>скриншот чека</b> одним фото или файлом."
+    )
+
+
+@router.message(PurchaseState.waiting_for_receipt)
+async def receive_sbp_receipt(message: Message, state: FSMContext, session_factory, bot: Bot, admin_id: int):
+    data = await state.get_data()
+    try:
+        payment_id = int(data["manual_payment_id"])
+    except (KeyError, ValueError):
+        await state.clear()
+        await message.answer("⚠️ Платёж устарел. Начните оплату заново.")
+        return
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        receipt_type = "photo"
+    elif message.document and (
+        (message.document.mime_type or "").startswith("image/")
+        or message.document.mime_type == "application/pdf"
+    ):
+        file_id = message.document.file_id
+        receipt_type = "document"
+    else:
+        await message.answer("📎 Отправьте чек как фотографию, изображение или PDF-файл.")
+        return
+
+    with session_factory() as session:
+        result, payment = submit_manual_receipt(
+            session,
+            payment_id,
+            message.from_user.id,
+            file_id,
+            receipt_type,
+        )
+    if result != "submitted" or payment is None:
+        await state.clear()
+        await message.answer("⚠️ Этот чек уже отправлен или платёж не найден.")
+        return
+
+    caption = (
+        "🧾 <b>Новая оплата по СБП</b>\n\n"
+        f"Платёж: <code>#{payment.id}</code>\n"
+        f"Telegram: <code>{payment.telegram_user_id}</code>\n"
+        f"Пользователь сайта: <code>#{payment.user_id}</code>\n"
+        f"Сумма: <b>{format_rubles(Decimal(payment.rub_amount))} ₽</b>\n"
+        f"Токены: <b>{format_tokens(payment.token_amount)}</b>"
+    )
+    try:
+        if receipt_type == "photo":
+            sent = await bot.send_photo(
+                admin_id,
+                file_id,
+                caption=caption,
+                reply_markup=receipt_review_keyboard(payment.id),
+            )
+        else:
+            sent = await bot.send_document(
+                admin_id,
+                file_id,
+                caption=caption,
+                reply_markup=receipt_review_keyboard(payment.id),
+            )
+        with session_factory() as session:
+            attach_admin_message(session, payment.id, sent.message_id)
+    except Exception:
+        logger.exception("Could not forward SBP receipt %s to admin", payment.id)
+        await message.answer("⚠️ Чек сохранён, но администратор временно недоступен. Мы повторно проверим платёж.")
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Чек отправлен администратору.</b>\n"
+        "После проверки бот сообщит результат и автоматически начислит токены."
+    )
+
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        return
+    await state.clear()
+    await message.answer(
+        "🛡 <b>Админ-панель Emerald AI</b>\n\n"
+        "Управление платежами, пользователями и рассылками.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        stats = admin_statistics(session)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "📊 <b>Статистика</b>\n\n"
+            f"👥 Пользователей сайта: <b>{format_tokens(stats['users'])}</b>\n"
+            f"🔗 Привязано к Telegram: <b>{format_tokens(stats['linked'])}</b>\n"
+            f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> оплат · "
+            f"<b>{format_rubles(stats['crypto_rub'])} ₽</b>\n"
+            f"🏦 СБП: <b>{stats['sbp_paid']}</b> оплат · "
+            f"<b>{format_rubles(stats['sbp_rub'])} ₽</b>\n"
+            f"⏳ Чеков на проверке: <b>{stats['pending_sbp']}</b>",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@router.callback_query(F.data == "admin:users")
+async def admin_user_list(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        users = admin_users(session)
+    lines = ["👥 <b>Последние пользователи</b>", ""]
+    for user, telegram_id in users:
+        telegram = f"<code>{telegram_id}</code>" if telegram_id else "не привязан"
+        lines.append(
+            f"• <b>{html.escape(user.name[:40])}</b> · <code>#{user.id}</code>\n"
+            f"  {html.escape(user.email[:55])} · TG {telegram}\n"
+            f"  Баланс: <b>{format_tokens(user.token_balance)}</b>"
+        )
+    if not users:
+        lines.append("Пользователей пока нет.")
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer("\n".join(lines), reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:payments")
+async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        payments = recent_manual_payments(session)
+    status_names = {
+        "awaiting_receipt": "ждём чек",
+        "pending_review": "на проверке",
+        "approved": "одобрен",
+        "rejected": "отклонён",
+    }
+    lines = ["🧾 <b>Последние платежи СБП</b>", ""]
+    for payment in payments:
+        lines.append(
+            f"• <code>#{payment.id}</code> · {format_rubles(Decimal(payment.rub_amount))} ₽ · "
+            f"{status_names.get(payment.status, payment.status)}\n"
+            f"  TG <code>{payment.telegram_user_id}</code> · {format_tokens(payment.token_amount)} токенов"
+        )
+    if not payments:
+        lines.append("Платежей пока нет.")
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer("\n".join(lines), reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_for_broadcast)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "📣 <b>Новая рассылка</b>\n\n"
+            "Отправьте одно сообщение. Можно использовать текст, фото, видео или файл.\n"
+            "Для отмены отправьте /cancel."
+        )
+
+
+@router.message(AdminState.waiting_for_broadcast)
+async def admin_broadcast_preview(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    await state.set_state(AdminState.confirming_broadcast)
+    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id)
+    await message.answer(
+        "👀 Сообщение принято. Запустить рассылку всем привязанным пользователям?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚀 Отправить", callback_data="broadcast:confirm"),
+            InlineKeyboardButton(text="✖️ Отмена", callback_data="broadcast:cancel"),
+        ]]),
+    )
+
+
+@router.callback_query(AdminState.confirming_broadcast, F.data == "broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Рассылка отменена")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(AdminState.confirming_broadcast, F.data == "broadcast:confirm")
+async def admin_broadcast_send(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    bot: Bot,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    source_chat_id = data.get("source_chat_id")
+    source_message_id = data.get("source_message_id")
+    if not source_chat_id or not source_message_id:
+        await state.clear()
+        await callback.answer("Сообщение устарело", show_alert=True)
+        return
+    with session_factory() as session:
+        recipients = broadcast_recipients(session)
+    await callback.answer("Рассылка запущена")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+    delivered = 0
+    failed = 0
+    for telegram_id in recipients:
+        if telegram_id == admin_id:
+            continue
+        try:
+            await bot.copy_message(telegram_id, source_chat_id, source_message_id)
+            delivered += 1
+        except Exception:
+            failed += 1
+            logger.info("Broadcast delivery failed for telegram_user_id=%s", telegram_id)
+        await asyncio.sleep(0.04)
+    await state.clear()
+    if callback.message:
+        await callback.message.answer(
+            "✅ <b>Рассылка завершена</b>\n\n"
+            f"Доставлено: <b>{delivered}</b>\n"
+            f"Не доставлено: <b>{failed}</b>",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@router.callback_query(F.data.startswith("receipt:"))
+async def review_sbp_receipt(callback: CallbackQuery, session_factory, bot: Bot, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, action, raw_payment_id = callback.data.split(":", 2)
+        payment_id = int(raw_payment_id)
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректный платёж", show_alert=True)
+        return
+    if action not in {"approve", "reject"}:
+        await callback.answer("Некорректное действие", show_alert=True)
+        return
+
+    with session_factory() as session:
+        result, payment, balance = review_manual_payment(
+            session,
+            payment_id,
+            admin_id,
+            approve=action == "approve",
+        )
+    if payment is None:
+        await callback.answer("Платёж не найден", show_alert=True)
+        return
+    if result.startswith("already"):
+        await callback.answer("Платёж уже обработан", show_alert=True)
+        return
+    if result == "not_ready":
+        await callback.answer("Чек ещё не получен", show_alert=True)
+        return
+    if result == "invalid":
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    if result == "approved":
+        await callback.answer("Оплата одобрена")
+        await bot.send_message(
+            payment.telegram_user_id,
+            "✅ <b>Оплата по СБП одобрена!</b>\n"
+            f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+            f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+        )
+        if callback.message:
+            await callback.message.answer(f"✅ Платёж <code>#{payment.id}</code> одобрен и начислен.")
+    else:
+        await callback.answer("Оплата отклонена")
+        await bot.send_message(
+            payment.telegram_user_id,
+            "❌ <b>Оплата по СБП отклонена.</b>\n"
+            "Если это ошибка, создайте новый платёж и отправьте читаемый чек.",
+        )
+        if callback.message:
+            await callback.message.answer(f"❌ Платёж <code>#{payment.id}</code> отклонён.")
 
 
 @router.callback_query(F.data.startswith("check:"))
-async def check_payment(callback: CallbackQuery, session_factory, crypto: CryptoPayClient):
+async def check_payment(callback: CallbackQuery, session_factory, crypto: CryptoPayClient | None):
     try:
         payment_id = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError, AttributeError):
@@ -291,6 +724,9 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
         invoice_id = payment.invoice_id
     await callback.answer("🔍 Проверяю оплату…")
     if callback.message is None:
+        return
+    if crypto is None:
+        await callback.message.answer("⚠️ Crypto Bot сейчас недоступен. Попробуйте позже или выберите СБП.")
         return
     try:
         invoice = await crypto.get_invoice(invoice_id)
@@ -416,48 +852,58 @@ async def main():
     load_dotenv()
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     crypto_token = os.getenv("CRYPTOBOT_TOKEN", "").strip()
+    try:
+        admin_id = int(os.getenv("ADMIN_ID", str(DEFAULT_ADMIN_ID)).strip())
+    except ValueError as error:
+        raise RuntimeError("ADMIN_ID must be a Telegram numeric user ID") from error
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is not configured")
-    if not crypto_token:
-        raise RuntimeError("CRYPTOBOT_TOKEN is not configured")
-    if bot_token == crypto_token:
+    if crypto_token and bot_token == crypto_token:
         raise RuntimeError("CRYPTOBOT_TOKEN must be a Crypto Pay app token, not BOT_TOKEN")
 
     engine, session_factory = database_from_environment()
     await asyncio.to_thread(Base.metadata.create_all, engine)
-    crypto = CryptoPayClient(crypto_token)
-    try:
-        crypto_app = await crypto.get_me()
-    except CryptoPayError as error:
-        await crypto.close()
-        engine.dispose()
-        raise RuntimeError(
-            f"Crypto Pay authentication failed: {error}. Check CRYPTOBOT_TOKEN and IP allowlist."
-        ) from error
-    logger.info("Crypto Pay authenticated: app_id=%s name=%s", crypto_app.get("app_id"), crypto_app.get("name"))
+    crypto = CryptoPayClient(crypto_token) if crypto_token else None
+    if crypto is not None:
+        try:
+            crypto_app = await crypto.get_me()
+        except CryptoPayError as error:
+            await crypto.close()
+            engine.dispose()
+            raise RuntimeError(
+                f"Crypto Pay authentication failed: {error}. Check CRYPTOBOT_TOKEN and IP allowlist."
+            ) from error
+        logger.info("Crypto Pay authenticated: app_id=%s name=%s", crypto_app.get("app_id"), crypto_app.get("name"))
+    else:
+        logger.warning("CRYPTOBOT_TOKEN is not configured; only SBP payments are available")
 
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     dispatcher.errors.register(handle_error)
     stop_reconciliation = asyncio.Event()
-    reconciliation_task = asyncio.create_task(
-        payment_reconciliation_loop(bot, session_factory, crypto, stop_reconciliation),
-        name="crypto-pay-reconciliation",
-    )
+    reconciliation_task = None
+    if crypto is not None:
+        reconciliation_task = asyncio.create_task(
+            payment_reconciliation_loop(bot, session_factory, crypto, stop_reconciliation),
+            name="crypto-pay-reconciliation",
+        )
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(
             bot,
             session_factory=session_factory,
             crypto=crypto,
+            admin_id=admin_id,
             allowed_updates=dispatcher.resolve_used_update_types(),
             close_bot_session=False,
         )
     finally:
         stop_reconciliation.set()
-        await reconciliation_task
-        await crypto.close()
+        if reconciliation_task is not None:
+            await reconciliation_task
+        if crypto is not None:
+            await crypto.close()
         await bot.session.close()
         engine.dispose()
 

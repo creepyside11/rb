@@ -19,6 +19,8 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
     token_balance: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
@@ -54,6 +56,29 @@ class TokenPayment(Base):
     paid_amount: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ManualPayment(Base):
+    """SBP payment reviewed by an administrator from inside Telegram."""
+
+    __tablename__ = "manual_token_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    purchase_link_id: Mapped[int] = mapped_column(
+        ForeignKey("purchase_links.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    rub_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="awaiting_receipt", index=True)
+    receipt_file_id: Mapped[str | None] = mapped_column(String(255))
+    receipt_type: Mapped[str | None] = mapped_column(String(16))
+    admin_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 def normalize_database_url(url: str) -> str:

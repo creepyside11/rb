@@ -1,8 +1,8 @@
 from decimal import Decimal, InvalidOperation, ROUND_UP
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from database import PurchaseLink, TokenPayment, User, utcnow
+from database import ManualPayment, PurchaseLink, TokenPayment, User, utcnow
 
 
 PACKAGES = {
@@ -115,3 +115,133 @@ def credit_verified_payment(session, payment_id: int, invoice: dict):
     payment.paid_at = utcnow()
     session.commit()
     return "credited", payment
+
+
+def create_manual_payment(
+    session,
+    link: PurchaseLink,
+    telegram_user_id: int,
+    rub_amount: Decimal,
+    token_amount: int,
+):
+    payment = ManualPayment(
+        user_id=link.user_id,
+        purchase_link_id=link.id,
+        telegram_user_id=telegram_user_id,
+        rub_amount=Decimal(rub_amount),
+        token_amount=token_amount,
+        status="awaiting_receipt",
+    )
+    session.add(payment)
+    session.commit()
+    return payment
+
+
+def submit_manual_receipt(session, payment_id: int, telegram_user_id: int, file_id: str, receipt_type: str):
+    payment = session.execute(
+        select(ManualPayment).where(ManualPayment.id == payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None or payment.telegram_user_id != telegram_user_id:
+        return "invalid", None
+    if payment.status != "awaiting_receipt":
+        return "already", payment
+    payment.receipt_file_id = file_id
+    payment.receipt_type = receipt_type
+    payment.status = "pending_review"
+    payment.submitted_at = utcnow()
+    session.commit()
+    return "submitted", payment
+
+
+def attach_admin_message(session, payment_id: int, admin_message_id: int):
+    payment = session.get(ManualPayment, payment_id)
+    if payment is None:
+        return None
+    payment.admin_message_id = admin_message_id
+    session.commit()
+    return payment
+
+
+def review_manual_payment(session, payment_id: int, admin_id: int, approve: bool):
+    """Review once under row locks; approved payments credit the balance exactly once."""
+    payment = session.execute(
+        select(ManualPayment).where(ManualPayment.id == payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None:
+        return "invalid", None, None
+    if payment.status == "approved":
+        user = session.get(User, payment.user_id)
+        return "already_approved", payment, user.token_balance if user else None
+    if payment.status == "rejected":
+        return "already_rejected", payment, None
+    if payment.status != "pending_review":
+        return "not_ready", payment, None
+
+    payment.reviewed_by = admin_id
+    payment.reviewed_at = utcnow()
+    if not approve:
+        payment.status = "rejected"
+        session.commit()
+        return "rejected", payment, None
+
+    user = session.execute(select(User).where(User.id == payment.user_id).with_for_update()).scalar_one_or_none()
+    if user is None:
+        return "invalid", payment, None
+    user.token_balance += payment.token_amount
+    payment.status = "approved"
+    session.commit()
+    return "approved", payment, user.token_balance
+
+
+def admin_statistics(session):
+    users = session.scalar(select(func.count(User.id))) or 0
+    linked = session.scalar(
+        select(func.count(PurchaseLink.id)).where(PurchaseLink.telegram_user_id.is_not(None))
+    ) or 0
+    crypto_paid = session.scalar(
+        select(func.count(TokenPayment.id)).where(TokenPayment.status == "paid")
+    ) or 0
+    crypto_rub = session.scalar(
+        select(func.coalesce(func.sum(TokenPayment.rub_amount), 0)).where(TokenPayment.status == "paid")
+    ) or 0
+    sbp_paid = session.scalar(
+        select(func.count(ManualPayment.id)).where(ManualPayment.status == "approved")
+    ) or 0
+    sbp_rub = session.scalar(
+        select(func.coalesce(func.sum(ManualPayment.rub_amount), 0)).where(ManualPayment.status == "approved")
+    ) or 0
+    pending_sbp = session.scalar(
+        select(func.count(ManualPayment.id)).where(ManualPayment.status == "pending_review")
+    ) or 0
+    return {
+        "users": int(users),
+        "linked": int(linked),
+        "crypto_paid": int(crypto_paid),
+        "crypto_rub": Decimal(crypto_rub),
+        "sbp_paid": int(sbp_paid),
+        "sbp_rub": Decimal(sbp_rub),
+        "pending_sbp": int(pending_sbp),
+    }
+
+
+def admin_users(session, limit: int = 30):
+    return list(session.execute(
+        select(User, PurchaseLink.telegram_user_id)
+        .outerjoin(PurchaseLink, PurchaseLink.user_id == User.id)
+        .order_by(User.id.desc())
+        .limit(limit)
+    ).all())
+
+
+def broadcast_recipients(session):
+    return list(session.scalars(
+        select(PurchaseLink.telegram_user_id)
+        .where(PurchaseLink.telegram_user_id.is_not(None), PurchaseLink.is_active.is_(True))
+        .distinct()
+    ))
+
+
+def recent_manual_payments(session, limit: int = 20):
+    return list(session.scalars(
+        select(ManualPayment).order_by(ManualPayment.created_at.desc()).limit(limit)
+    ))

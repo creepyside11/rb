@@ -2,7 +2,7 @@ from decimal import Decimal, InvalidOperation, ROUND_UP
 
 from sqlalchemy import func, select
 
-from database import ManualPayment, PurchaseLink, TokenPayment, User, utcnow
+from database import ManualPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
 
 
 PACKAGES = {
@@ -15,6 +15,8 @@ PACKAGES = {
 TOKENS_PER_RUBLE = 1_000_000
 MIN_TOKEN_AMOUNT = 1_000_000
 MAX_TOKEN_AMOUNT = 1_000_000_000_000
+REFERRAL_MIN_TOPUP_TOKENS = 10_000_000
+REFERRAL_REWARD_TOKENS = 2_000_000
 
 
 def tokens_to_rubles(token_amount: int) -> Decimal:
@@ -85,6 +87,44 @@ def _same_decimal(left, right) -> bool:
         return False
 
 
+def apply_first_topup_referral_reward(
+    session,
+    referred_user_id: int,
+    topup_tokens: int,
+    payment_source: str,
+    payment_id: int,
+):
+    """Resolve a pending referral once, inside the payment transaction."""
+    referral = session.execute(
+        select(Referral)
+        .where(Referral.referred_user_id == referred_user_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if referral is None or referral.status != "pending":
+        return False
+
+    referral.first_topup_tokens = int(topup_tokens)
+    referral.payment_source = payment_source[:16]
+    referral.payment_id = payment_id
+    if topup_tokens < REFERRAL_MIN_TOPUP_TOKENS:
+        referral.status = "ineligible_minimum"
+        return False
+
+    referrer = session.execute(
+        select(User).where(User.id == referral.referrer_id).with_for_update()
+    ).scalar_one_or_none()
+    if referrer is None or referrer.id == referred_user_id:
+        referral.status = "blocked_self"
+        return False
+
+    reward = int(referral.reward_tokens or REFERRAL_REWARD_TOKENS)
+    referrer.token_balance += reward
+    referral.status = "rewarded"
+    referral.qualified_at = utcnow()
+    referral.rewarded_at = referral.qualified_at
+    return True
+
+
 def credit_verified_payment(session, payment_id: int, invoice: dict):
     payment = session.execute(
         select(TokenPayment).where(TokenPayment.id == payment_id).with_for_update()
@@ -113,6 +153,9 @@ def credit_verified_payment(session, payment_id: int, invoice: dict):
     payment.paid_asset = str(invoice.get("paid_asset") or "")[:16] or None
     payment.paid_amount = str(invoice.get("paid_amount") or "")[:64] or None
     payment.paid_at = utcnow()
+    apply_first_topup_referral_reward(
+        session, user.id, payment.token_amount, "crypto", payment.id
+    )
     session.commit()
     return "credited", payment
 
@@ -189,6 +232,9 @@ def review_manual_payment(session, payment_id: int, admin_id: int, approve: bool
         return "invalid", payment, None
     user.token_balance += payment.token_amount
     payment.status = "approved"
+    apply_first_topup_referral_reward(
+        session, user.id, payment.token_amount, "sbp", payment.id
+    )
     session.commit()
     return "approved", payment, user.token_balance
 

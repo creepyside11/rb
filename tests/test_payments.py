@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import Base, ManualPayment, PurchaseLink, TokenPayment, User
+from database import Base, ManualPayment, PurchaseLink, Referral, TokenPayment, User
 from cryptopay import CryptoPayClient, CryptoPayError
 from payments import (
     admin_statistics,
@@ -107,8 +107,94 @@ class PaymentTest(unittest.TestCase):
         self.assertEqual(result, "invalid")
         self.assertEqual(balance, 5_000_000)
 
+    def test_first_qualifying_crypto_topup_rewards_referrer_once(self):
+        with self.Session() as session:
+            session.add(User(id=2, name="Referrer", email="ref@example.com", token_balance=5_000_000))
+            session.add(Referral(
+                referrer_id=2,
+                referred_user_id=1,
+                status="pending",
+                reward_tokens=2_000_000,
+            ))
+            session.add(TokenPayment(
+                id=9,
+                user_id=1,
+                purchase_link_id=1,
+                telegram_user_id=101,
+                invoice_id=99,
+                payload="ref-payment",
+                rub_amount=Decimal("10.00"),
+                token_amount=10_000_000,
+                status="pending",
+            ))
+            session.commit()
+        invoice = {
+            "invoice_id": 99,
+            "payload": "ref-payment",
+            "status": "paid",
+            "currency_type": "fiat",
+            "fiat": "RUB",
+            "amount": "10.00",
+        }
+        with self.Session() as session:
+            first, _ = credit_verified_payment(session, 9, invoice)
+            second, _ = credit_verified_payment(session, 9, invoice)
+            referral = session.query(Referral).one()
+            referrer_balance = session.get(User, 2).token_balance
+        self.assertEqual(first, "credited")
+        self.assertEqual(second, "already")
+        self.assertEqual(referrer_balance, 7_000_000)
+        self.assertEqual(referral.status, "rewarded")
+        self.assertEqual(referral.first_topup_tokens, 10_000_000)
+        self.assertEqual(referral.payment_source, "crypto")
+
+    def test_small_first_topup_never_unlocks_reward_later(self):
+        with self.Session() as session:
+            session.add(User(id=2, name="Referrer", email="ref@example.com", token_balance=5_000_000))
+            session.add(Referral(
+                referrer_id=2,
+                referred_user_id=1,
+                status="pending",
+                reward_tokens=2_000_000,
+            ))
+            for payment_id, amount in ((10, 5), (11, 20)):
+                session.add(TokenPayment(
+                    id=payment_id,
+                    user_id=1,
+                    purchase_link_id=1,
+                    telegram_user_id=101,
+                    invoice_id=100 + payment_id,
+                    payload=f"small-{payment_id}",
+                    rub_amount=Decimal(f"{amount}.00"),
+                    token_amount=amount * 1_000_000,
+                    status="pending",
+                ))
+            session.commit()
+        with self.Session() as session:
+            for payment_id, amount in ((10, 5), (11, 20)):
+                credit_verified_payment(session, payment_id, {
+                    "invoice_id": 100 + payment_id,
+                    "payload": f"small-{payment_id}",
+                    "status": "paid",
+                    "currency_type": "fiat",
+                    "fiat": "RUB",
+                    "amount": f"{amount}.00",
+                })
+            referral = session.query(Referral).one()
+            referrer_balance = session.get(User, 2).token_balance
+        self.assertEqual(referral.status, "ineligible_minimum")
+        self.assertEqual(referral.first_topup_tokens, 5_000_000)
+        self.assertEqual(referrer_balance, 5_000_000)
+
     def test_sbp_receipt_is_approved_and_credited_exactly_once(self):
         with self.Session() as session:
+            session.add(User(id=2, name="Referrer", email="ref@example.com", token_balance=5_000_000))
+            session.add(Referral(
+                referrer_id=2,
+                referred_user_id=1,
+                status="pending",
+                reward_tokens=2_000_000,
+            ))
             link = session.get(PurchaseLink, 1)
             payment = create_manual_payment(session, link, 101, Decimal("25.00"), 25_000_000)
             payment_id = payment.id
@@ -119,12 +205,17 @@ class PaymentTest(unittest.TestCase):
         with self.Session() as session:
             repeated, _, second_balance = review_manual_payment(session, payment_id, 7973988177, True)
             stored = session.get(ManualPayment, payment_id)
+            referral = session.query(Referral).one()
+            referrer_balance = session.get(User, 2).token_balance
         self.assertEqual(result, "submitted")
         self.assertEqual(approved, "approved")
         self.assertEqual(repeated, "already_approved")
         self.assertEqual(first_balance, 30_000_000)
         self.assertEqual(second_balance, 30_000_000)
         self.assertEqual(stored.status, "approved")
+        self.assertEqual(referral.status, "rewarded")
+        self.assertEqual(referral.payment_source, "sbp")
+        self.assertEqual(referrer_balance, 7_000_000)
 
     def test_rejected_sbp_receipt_never_credits_balance(self):
         with self.Session() as session:

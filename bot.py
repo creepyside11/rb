@@ -48,6 +48,10 @@ DEFAULT_ADMIN_ID = 7973988177
 SBP_PHONE = "+79818376180"
 SBP_BANK = "ЮMoney"
 SBP_RECIPIENT = "Иван Б."
+SUPPORT_URL = "https://t.me/EmeraldAiSupport"
+PRIVACY_POLICY_URL = "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-08-21-72"
+USER_AGREEMENT_URL = "https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE-08-21-55"
+PAYMENT_ANNOUNCEMENT = "Скоро будет Платега"
 
 
 class PurchaseState(StatesGroup):
@@ -69,6 +73,23 @@ def format_rubles(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01")), "f").rstrip("0").rstrip(".")
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Купить токены", callback_data="show:packages")],
+        [InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")],
+        [InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL)],
+        [InlineKeyboardButton(text="📄 Пользовательское соглашение", url=USER_AGREEMENT_URL)],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=PRIVACY_POLICY_URL)],
+    ])
+
+
+def balance_text(amount: int) -> str:
+    return (
+        f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов\n\n"
+        f"{PAYMENT_ANNOUNCEMENT}"
+    )
+
+
 def package_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
@@ -79,6 +100,7 @@ def package_keyboard() -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text="✍️ Ввести своё количество", callback_data="buy:custom")])
     rows.append([InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -162,22 +184,27 @@ async def start(
             link = get_bound_link(session, message.from_user.id)
             result = "ok" if link else "missing"
         if result == "claimed":
-            await message.answer("🔒 Эта ссылка уже привязана к другому Telegram‑аккаунту.")
+            await message.answer(
+                "🔒 Эта ссылка уже привязана к другому Telegram‑аккаунту.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
         if result in {"invalid", "missing"} or link is None:
             await message.answer(
                 "🔗 Откройте личный кабинет Emerald AI и нажмите «Купить токены», "
-                "чтобы получить персональную ссылку."
+                "чтобы получить персональную ссылку.\n\n"
+                "Вы также можете обратиться в поддержку или ознакомиться с документами:",
+                reply_markup=main_menu_keyboard(),
             )
             return
         user = session.get(User, link.user_id)
         balance = user.token_balance if user else 0
     await message.answer(
-        "💚 <b>Пополнение Emerald AI</b>\n\n"
+        "💚 <b>Emerald AI</b>\n\n"
         "💎 Курс: <b>1 000 000 токенов = 1 ₽</b>\n"
-        f"💰 Ваш баланс: <b>{format_tokens(balance)}</b> токенов\n\n"
-        "Выберите пакет или введите своё количество:",
-        reply_markup=package_keyboard(),
+        f"{balance_text(balance)}\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -185,9 +212,12 @@ async def start(
 async def balance(message: Message, session_factory):
     amount = read_balance(session_factory, message.from_user.id)
     if amount is None:
-        await message.answer("🔗 Сначала откройте бота по ссылке из кабинета Emerald AI.")
+        await message.answer(
+            "🔗 Сначала откройте бота по ссылке из кабинета Emerald AI.",
+            reply_markup=main_menu_keyboard(),
+        )
     else:
-        await message.answer(f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов")
+        await message.answer(balance_text(amount), reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(F.data == "show:balance")
@@ -197,14 +227,34 @@ async def show_balance(callback: CallbackQuery, session_factory):
     if callback.message:
         text = "🔗 Сначала откройте покупку с сайта."
         if amount is not None:
-            text = f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов"
-        await callback.message.answer(text)
+            text = balance_text(amount)
+        await callback.message.answer(text, reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(F.data == "show:menu")
+async def show_main_menu(callback: CallbackQuery, state: FSMContext, session_factory):
+    await callback.answer()
+    await state.clear()
+    amount = read_balance(session_factory, callback.from_user.id)
+    if callback.message:
+        text = "💚 <b>Emerald AI</b>\n\nВыберите действие:"
+        if amount is not None:
+            text = f"💚 <b>Emerald AI</b>\n\n{balance_text(amount)}\n\nВыберите действие:"
+        await callback.message.answer(text, reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(F.data == "show:packages")
-async def show_packages(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
+async def show_packages(callback: CallbackQuery, state: FSMContext, session_factory):
     await state.clear()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+    if link is None:
+        await callback.answer(
+            "Сначала откройте покупку по персональной ссылке из кабинета Emerald AI.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
     if callback.message:
         await callback.message.answer("💎 Выберите пакет:", reply_markup=package_keyboard())
 

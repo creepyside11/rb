@@ -4,6 +4,7 @@ from bot import (
     PRIVACY_POLICY_URL,
     SUPPORT_URL,
     USER_AGREEMENT_URL,
+    admin_keyboard,
     balance_text,
     main_menu_keyboard,
     package_keyboard,
@@ -27,7 +28,7 @@ class BotMenuTest(unittest.TestCase):
         self.assertIn("25 000 000", text)
         self.assertNotIn("Скоро", text)
 
-    def test_sbp_button_uses_automatic_platega_flow(self):
+    def test_platega_button_uses_automatic_checkout_flow(self):
         buttons = [
             button
             for row in payment_method_keyboard(crypto_available=False, platega_available=True).inline_keyboard
@@ -35,7 +36,24 @@ class BotMenuTest(unittest.TestCase):
         ]
         by_callback = {button.callback_data: button for button in buttons if button.callback_data}
 
-        self.assertEqual(by_callback["method:sbp"].text, "🏦 СБП · автоматически")
+        self.assertEqual(
+            by_callback["method:platega"].text,
+            "🏦 СБП Платега · автоматически",
+        )
+        self.assertNotIn("method:sbp", by_callback)
+
+    def test_admin_payment_button_uses_platega_name(self):
+        buttons = [
+            button
+            for row in admin_keyboard().inline_keyboard
+            for button in row
+        ]
+        by_callback = {button.callback_data: button for button in buttons}
+
+        self.assertEqual(
+            by_callback["admin:payments"].text,
+            "🧾 Платежи СБП Платега",
+        )
 
     def test_package_menu_can_return_to_main_menu(self):
         callbacks = {

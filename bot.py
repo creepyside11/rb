@@ -105,7 +105,7 @@ def payment_method_keyboard(
     if crypto_available:
         rows.append([InlineKeyboardButton(text="💎 Crypto Bot · автоматически", callback_data="method:crypto")])
     if platega_available:
-        rows.append([InlineKeyboardButton(text="🏦 СБП · автоматически", callback_data="method:sbp")])
+        rows.append([InlineKeyboardButton(text="🏦 СБП Платега · автоматически", callback_data="method:platega")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -117,7 +117,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
         ],
         [
-            InlineKeyboardButton(text="🧾 Платежи Platega", callback_data="admin:payments"),
+            InlineKeyboardButton(text="🧾 Платежи СБП Платега", callback_data="admin:payments"),
             InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast"),
         ],
     ])
@@ -137,7 +137,7 @@ def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
 
 def platega_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏦 Перейти к оплате", url=payment_url)],
+        [InlineKeyboardButton(text="🏦 Оплатить через СБП Платега", url=payment_url)],
         [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages")],
     ])
 
@@ -300,7 +300,7 @@ async def issue_invoice(
     crypto: CryptoPayClient | None,
 ):
     if crypto is None:
-        await message.answer("⚠️ Crypto Bot сейчас недоступен. Выберите оплату по СБП.")
+        await message.answer("⚠️ Crypto Bot сейчас недоступен. Выберите СБП Платега.")
         return
     with session_factory() as session:
         link = get_bound_link(session, telegram_user_id)
@@ -353,7 +353,7 @@ async def issue_platega_invoice(
     platega: PlategaClient | None,
 ):
     if platega is None:
-        await message.answer("⚠️ Оплата по СБП сейчас недоступна. Выберите другой способ.")
+        await message.answer("⚠️ СБП Платега сейчас недоступна. Выберите другой способ.")
         return
     with session_factory() as session:
         link = get_bound_link(session, telegram_user_id)
@@ -403,7 +403,7 @@ async def issue_platega_invoice(
             provider_ttl,
         )
     await message.answer(
-        f"🏦 <b>Счёт на {format_rubles(rub_amount)} ₽</b>\n"
+        f"🏦 <b>Счёт СБП Платега на {format_rubles(rub_amount)} ₽</b>\n"
         f"💎 Будет начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
         f"⏱ Срок действия: <b>{PLATEGA_INVOICE_TTL_MINUTES} минут</b>\n\n"
         "На странице оплаты выберите удобный способ. После успешной оплаты "
@@ -515,7 +515,10 @@ async def choose_payment_method(
             crypto,
         )
         return
-    if method != "sbp":
+    # Keep the old callback as a compatibility alias for payment-choice messages
+    # that Telegram users may still have open. Both values create only a Platega
+    # checkout; the removed manual SBP flow cannot be reached.
+    if method not in {"platega", "sbp"}:
         await callback.answer("Неизвестный способ оплаты", show_alert=True)
         return
     await callback.answer("⏳ Создаю счёт…")
@@ -557,9 +560,9 @@ async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
             f"🔗 Привязано к Telegram: <b>{format_tokens(stats['linked'])}</b>\n"
             f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> оплат · "
             f"<b>{format_rubles(stats['crypto_rub'])} ₽</b>\n"
-            f"🏦 Platega: <b>{stats['platega_paid']}</b> оплат · "
+            f"🏦 СБП Платега: <b>{stats['platega_paid']}</b> оплат · "
             f"<b>{format_rubles(stats['platega_rub'])} ₽</b>\n"
-            f"⏳ Счетов Platega в ожидании: <b>{stats['pending_platega']}</b>",
+            f"⏳ Счетов СБП Платега в ожидании: <b>{stats['pending_platega']}</b>",
             reply_markup=admin_keyboard(),
         )
 
@@ -600,13 +603,13 @@ async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id:
         "chargebacked": "возврат",
         "expired": "истёк",
     }
-    lines = ["🧾 <b>Последние платежи Platega</b>", ""]
+    lines = ["🧾 <b>Последние платежи СБП Платега</b>", ""]
     for payment in payments:
         lines.append(
             f"• <code>#{payment.id}</code> · {format_rubles(Decimal(payment.rub_amount))} ₽ · "
             f"{status_names.get(payment.status, payment.status)}\n"
             f"  TG <code>{payment.telegram_user_id}</code> · {format_tokens(payment.token_amount)} токенов\n"
-            f"  Platega <code>{html.escape(payment.transaction_id)}</code>"
+            f"  Платега <code>{html.escape(payment.transaction_id)}</code>"
         )
     if not payments:
         lines.append("Платежей пока нет.")
@@ -720,7 +723,7 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
     if callback.message is None:
         return
     if crypto is None:
-        await callback.message.answer("⚠️ Crypto Bot сейчас недоступен. Попробуйте позже или выберите СБП.")
+        await callback.message.answer("⚠️ Crypto Bot сейчас недоступен. Попробуйте позже или выберите СБП Платега.")
         return
     try:
         invoice = await crypto.get_invoice(invoice_id)
@@ -949,7 +952,7 @@ async def main():
     else:
         logger.warning("CRYPTOBOT_TOKEN is not configured; Crypto Bot payments are unavailable")
     if platega is None:
-        logger.warning("Platega credentials are not configured; SBP payments are unavailable")
+        logger.warning("Platega credentials are not configured; Platega payments are unavailable")
 
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()

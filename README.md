@@ -6,7 +6,7 @@ Users can select a ready-made package or enter an exact token amount. The rate i
 
 Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation. The Platega flow never asks for a receipt or an administrator approval.
 
-The user-facing method is still named «СБП», but it creates a Platega v2 payment link without `paymentMethod`. The hosted Platega page therefore lets the payer choose any method enabled for the merchant instead of redirecting directly to SBP.
+The user-facing method is named «СБП Платега». It creates a Platega v2 payment link without `paymentMethod`, so the hosted Platega page lets the payer choose any method enabled for the merchant instead of redirecting directly to SBP.
 
 ## Environment
 

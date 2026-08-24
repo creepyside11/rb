@@ -8,8 +8,6 @@ from bot import (
     admin_keyboard,
     balance_text,
     main_menu_keyboard,
-    main_menu_links_keyboard,
-    main_menu_rich_html,
     package_keyboard,
     payment_keyboard,
     payment_method_keyboard,
@@ -34,20 +32,6 @@ class BotMenuTest(unittest.TestCase):
 
         self.assertIn("25 000 000", text)
         self.assertNotIn("Скоро", text)
-
-    def test_rich_main_menu_has_buttons_inside_message(self):
-        rich_html = main_menu_rich_html("<b>Emerald AI</b>")
-        link_buttons = [
-            button
-            for row in main_menu_links_keyboard().inline_keyboard
-            for button in row
-        ]
-
-        self.assertIn('<tg-button-row align="center">', rich_html)
-        self.assertIn('style="primary" data="show:packages"', rich_html)
-        self.assertIn('style="success" data="show:balance"', rich_html)
-        self.assertTrue(all(button.url for button in link_buttons))
-        self.assertTrue(all(button.style == "primary" for button in link_buttons))
 
     def test_platega_button_uses_automatic_checkout_flow(self):
         buttons = [

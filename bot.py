@@ -10,10 +10,8 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.filters.command import CommandObject
-from aiogram.methods.base import TelegramMethod
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -23,7 +21,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from cryptopay import CryptoPayClient, CryptoPayError, invoice_payment_url
 from database import Base, TokenPayment, User, database_from_environment
 from platega import PlategaClient, PlategaError
-from telegram_bot_api_10_3 import enable_bot_api_10_3_models
 from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
@@ -54,7 +51,6 @@ from payments import (
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger("emerald-payment-bot")
-enable_bot_api_10_3_models()
 router = Router(name="emerald-payments")
 LINK_PATTERN = re.compile(r"^buy_([A-Za-z0-9_-]{30,48})$")
 DEFAULT_ADMIN_ID = 7973988177
@@ -75,17 +71,6 @@ class AdminState(StatesGroup):
     waiting_for_token_price = State()
 
 
-class SendRichMessage(TelegramMethod[Message]):
-    """Bot API 10.3 method; remove when aiogram ships its native wrapper."""
-
-    __returning__ = Message
-    __api_method__ = "sendRichMessage"
-
-    chat_id: int | str
-    rich_message: dict[str, Any]
-    reply_markup: InlineKeyboardMarkup | None = None
-
-
 def format_tokens(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -104,31 +89,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def main_menu_links_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=main_menu_keyboard().inline_keyboard[2:])
-
-
-def main_menu_rich_html(text: str) -> str:
-    return (
-        f"<p>{text}</p>"
-        '<tg-button-row align="center">'
-        '<tg-button type="callback_data" style="primary" data="show:packages">💎 Купить токены</tg-button>'
-        '<tg-button type="callback_data" style="success" data="show:balance">💰 Баланс</tg-button>'
-        "</tg-button-row>"
-    )
-
-
 async def send_main_menu(bot: Bot, chat_id: int, text: str) -> Message:
-    """Send actions inside the message, with a regular-message compatibility fallback."""
-    try:
-        return await bot(SendRichMessage(
-            chat_id=chat_id,
-            rich_message={"html": main_menu_rich_html(text)},
-            reply_markup=main_menu_links_keyboard(),
-        ))
-    except TelegramAPIError:
-        logger.warning("sendRichMessage is unavailable; using a regular menu", exc_info=True)
-        return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+    return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
 
 
 def balance_text(amount: int) -> str:

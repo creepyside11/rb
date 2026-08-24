@@ -1,10 +1,12 @@
 # Emerald AI payment bot
 
-Telegram worker for `@emeraldairobot`, built on aiogram 3. It accepts only personal links created by the Emerald AI account dashboard and supports automatic Crypto Bot invoices plus manually reviewed SBP payments.
+Telegram worker for `@emeraldairobot`, built on aiogram 3. It accepts only personal links created by the Emerald AI account dashboard and supports automatic Crypto Bot and Platega payments.
 
 Users can select a ready-made package or enter an exact token amount. The rate is 1,000,000 tokens per ₽1; fractional prices are rounded up to one kopeck and shown before invoice creation.
 
-Pending invoices are reconciled with Crypto Pay every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation; the manual check button remains as an immediate fallback.
+Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation. The Platega flow never asks for a receipt or an administrator approval.
+
+The user-facing method is still named «СБП», but it creates a Platega v2 payment link without `paymentMethod`. The hosted Platega page therefore lets the payer choose any method enabled for the merchant instead of redirecting directly to SBP.
 
 ## Environment
 
@@ -14,6 +16,10 @@ Set these variables on the bot hosting:
 BOT_TOKEN=...
 DATABASE_URL=...
 CRYPTOBOT_TOKEN=...
+PLATEGA_MERCHANT_ID=...
+PLATEGA_API_KEY=...
+PLATEGA_RETURN_URL=https://t.me/emeraldairobot
+PLATEGA_FAILED_URL=https://t.me/emeraldairobot
 ADMIN_ID=7973988177
 ```
 
@@ -23,9 +29,11 @@ ADMIN_ID=7973988177
 
 `BOT_TOKEN` and `CRYPTOBOT_TOKEN` are different credentials. On startup the worker calls Crypto Pay `getMe`; an invalid token or blocked hosting IP therefore appears immediately in the hosting log instead of failing later with a generic invoice error.
 
-`ADMIN_ID` is the only Telegram account allowed to open `/admin`, review SBP receipts, inspect statistics and users, and run broadcasts. If omitted, the configured default is `7973988177`.
+`PLATEGA_MERCHANT_ID` and `PLATEGA_API_KEY` are sent only in the documented `X-MerchantId` and `X-Secret` request headers. Configure both or neither; a partial configuration stops startup instead of exposing a broken payment button. Keep real values in the hosting environment, never in the repository.
 
-For SBP, the bot shows the configured phone, bank and recipient, receives a screenshot or PDF receipt, and forwards it to the administrator with one-time «Одобрить» / «Отклонить» actions.
+Set the invoice lifetime to **60 minutes** in the Platega merchant settings. The public [create-payment-link API](https://docs.platega.io/%D1%81%D0%BE%D0%B7%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5-%D0%BF%D0%BB%D0%B0%D1%82%D0%B5%D0%B6%D0%BD%D0%BE%D0%B9-%D1%81%D1%81%D1%8B%D0%BB%D0%BA%D0%B8-%D0%B1%D0%B5%D0%B7-%D0%B7%D0%B0%D0%B4%D0%B0%D0%BD%D0%BD%D0%BE%D0%B3%D0%BE-%D0%BC%D0%B5%D1%82%D0%BE%D0%B4%D0%B0-33845703e0) returns `expiresIn` but does not accept a lifetime field. The worker also stops polling and marks its local payment expired after 60 minutes; it logs a warning when the provider returns a different lifetime.
+
+`ADMIN_ID` is the only Telegram account allowed to open `/admin`, inspect Crypto Bot and Platega statistics and transactions, inspect users, and run broadcasts. If omitted, the configured default is `7973988177`.
 
 ## Run
 
@@ -40,6 +48,6 @@ The process is a long-running Telegram polling worker, not a web service. Run ex
 
 - A personal link is bound to the first Telegram account that opens it.
 - Package values are selected only from a server-side allowlist.
-- A paid status, invoice ID, private payload, fiat currency, and RUB amount are re-read from Crypto Pay before crediting.
+- A paid status, transaction ID, private payload, RUB currency, and amount are re-read from the payment provider before crediting.
 - PostgreSQL row locks and the final `paid` state make repeated checks idempotent.
-- SBP approval also uses row locks, so a repeated admin click cannot credit the balance twice.
+- Platega credits only the documented `CONFIRMED` status; repeated polls cannot credit the balance twice.

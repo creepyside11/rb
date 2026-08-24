@@ -18,24 +18,24 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
 from cryptopay import CryptoPayClient, CryptoPayError, invoice_payment_url
-from database import Base, ManualPayment, TokenPayment, User, database_from_environment
+from database import Base, TokenPayment, User, database_from_environment
+from platega import PlategaClient, PlategaError
 from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
     PACKAGES,
     admin_statistics,
     admin_users,
-    attach_admin_message,
     bind_purchase_link,
     broadcast_recipients,
+    create_platega_payment,
+    credit_verified_platega_payment,
     credit_verified_payment,
-    create_manual_payment,
     get_bound_link,
     get_pending_payments,
-    recent_manual_payments,
-    review_manual_payment,
+    get_pending_platega_payments,
+    recent_platega_payments,
     save_pending_payment,
-    submit_manual_receipt,
     tokens_to_rubles,
 )
 
@@ -45,19 +45,15 @@ logger = logging.getLogger("emerald-payment-bot")
 router = Router(name="emerald-payments")
 LINK_PATTERN = re.compile(r"^buy_([A-Za-z0-9_-]{30,48})$")
 DEFAULT_ADMIN_ID = 7973988177
-SBP_PHONE = "+79818376180"
-SBP_BANK = "ЮMoney"
-SBP_RECIPIENT = "Иван Б."
+PLATEGA_INVOICE_TTL_MINUTES = 60
 SUPPORT_URL = "https://t.me/EmeraldAiSupport"
 PRIVACY_POLICY_URL = "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-08-21-72"
 USER_AGREEMENT_URL = "https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE-08-21-55"
-PAYMENT_ANNOUNCEMENT = "Скоро будет Платега"
 
 
 class PurchaseState(StatesGroup):
     waiting_for_token_amount = State()
     choosing_payment_method = State()
-    waiting_for_receipt = State()
 
 
 class AdminState(StatesGroup):
@@ -84,10 +80,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def balance_text(amount: int) -> str:
-    return (
-        f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов\n\n"
-        f"{PAYMENT_ANNOUNCEMENT}"
-    )
+    return f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов"
 
 
 def package_keyboard() -> InlineKeyboardMarkup:
@@ -104,11 +97,15 @@ def package_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def payment_method_keyboard(crypto_available: bool = True) -> InlineKeyboardMarkup:
+def payment_method_keyboard(
+    crypto_available: bool = True,
+    platega_available: bool = True,
+) -> InlineKeyboardMarkup:
     rows = []
     if crypto_available:
         rows.append([InlineKeyboardButton(text="💎 Crypto Bot · автоматически", callback_data="method:crypto")])
-    rows.append([InlineKeyboardButton(text="🏦 СБП · по чеку", callback_data="method:sbp")])
+    if platega_available:
+        rows.append([InlineKeyboardButton(text="🏦 СБП · автоматически", callback_data="method:sbp")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -120,17 +117,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
         ],
         [
-            InlineKeyboardButton(text="🧾 Платежи СБП", callback_data="admin:payments"),
+            InlineKeyboardButton(text="🧾 Платежи Platega", callback_data="admin:payments"),
             InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast"),
         ],
     ])
-
-
-def receipt_review_keyboard(payment_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"receipt:approve:{payment_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"receipt:reject:{payment_id}"),
-    ]])
 
 
 def is_admin(telegram_user_id: int, admin_id: int) -> bool:
@@ -141,6 +131,13 @@ def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить в Crypto Bot", url=payment_url)],
         [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check:{payment_id}")],
+        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages")],
+    ])
+
+
+def platega_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏦 Перейти к оплате", url=payment_url)],
         [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages")],
     ])
 
@@ -157,6 +154,16 @@ def crypto_error_message(error: CryptoPayError) -> str:
         hint = "Crypto Pay временно не отвечает. Попробуйте ещё раз через минуту."
     else:
         hint = "Проверьте настройки приложения Crypto Pay."
+    return f"❌ <b>Не удалось создать счёт</b>\n{hint}\n\nКод: <code>{html.escape(error.code)}</code>"
+
+
+def platega_error_message(error: PlategaError) -> str:
+    if error.status in {401, 403}:
+        hint = "Проверьте PLATEGA_MERCHANT_ID и PLATEGA_API_KEY."
+    elif error.code == "NETWORK_ERROR":
+        hint = "Platega временно не отвечает. Попробуйте ещё раз через минуту."
+    else:
+        hint = "Платёжная система отклонила создание счёта. Попробуйте позже."
     return f"❌ <b>Не удалось создать счёт</b>\n{hint}\n\nКод: <code>{html.escape(error.code)}</code>"
 
 
@@ -337,24 +344,99 @@ async def issue_invoice(
     )
 
 
+async def issue_platega_invoice(
+    message: Message,
+    telegram_user_id: int,
+    token_amount: int,
+    rub_amount: Decimal,
+    session_factory,
+    platega: PlategaClient | None,
+):
+    if platega is None:
+        await message.answer("⚠️ Оплата по СБП сейчас недоступна. Выберите другой способ.")
+        return
+    with session_factory() as session:
+        link = get_bound_link(session, telegram_user_id)
+        user = session.get(User, link.user_id) if link else None
+    if link is None:
+        await message.answer("🔗 Ссылка не привязана. Откройте покупку с сайта.")
+        return
+
+    payload = f"em_platega_{secrets.token_urlsafe(18)}"
+    try:
+        transaction = await platega.create_payment_link(
+            rub_amount,
+            token_amount,
+            payload,
+            link.user_id,
+            user.name if user else None,
+        )
+        payment_url = str(transaction.get("url") or transaction.get("redirect") or "")
+        with session_factory() as session:
+            current_link = get_bound_link(session, telegram_user_id)
+            if current_link is None:
+                raise RuntimeError("Purchase link was revoked")
+            payment = create_platega_payment(
+                session,
+                current_link,
+                telegram_user_id,
+                rub_amount,
+                token_amount,
+                payload,
+                transaction,
+                PLATEGA_INVOICE_TTL_MINUTES,
+            )
+    except PlategaError as error:
+        logger.warning("Platega create payment failed: %s", error)
+        await message.answer(platega_error_message(error))
+        return
+    except (RuntimeError, KeyError, ValueError, SQLAlchemyError):
+        logger.exception("Could not store Platega transaction")
+        await message.answer("❌ Счёт создан некорректно. Попробуйте ещё раз через минуту.")
+        return
+
+    provider_ttl = str(transaction.get("expiresIn") or "")
+    if provider_ttl and provider_ttl not in {"01:00:00", "60:00"}:
+        logger.warning(
+            "Platega transaction %s returned expiresIn=%s; configure a 60-minute lifetime in the merchant account",
+            payment.transaction_id,
+            provider_ttl,
+        )
+    await message.answer(
+        f"🏦 <b>Счёт на {format_rubles(rub_amount)} ₽</b>\n"
+        f"💎 Будет начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+        f"⏱ Срок действия: <b>{PLATEGA_INVOICE_TTL_MINUTES} минут</b>\n\n"
+        "На странице оплаты выберите удобный способ. После успешной оплаты "
+        "токены зачислятся автоматически — отправлять чек и нажимать кнопку проверки не нужно.",
+        reply_markup=platega_payment_keyboard(payment_url),
+    )
+
+
 async def offer_payment_methods(
     message: Message,
     state: FSMContext,
     token_amount: int,
     rub_amount: Decimal,
     crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
 ):
     await state.set_state(PurchaseState.choosing_payment_method)
     await state.update_data(token_amount=token_amount, rub_amount=str(rub_amount))
     await message.answer(
         f"💎 <b>{format_tokens(token_amount)}</b> токенов · <b>{format_rubles(rub_amount)} ₽</b>\n\n"
         "Выберите способ оплаты:",
-        reply_markup=payment_method_keyboard(crypto is not None),
+        reply_markup=payment_method_keyboard(crypto is not None, platega is not None),
     )
 
 
 @router.callback_query(F.data.startswith("buy:"))
-async def create_package_invoice(callback: CallbackQuery, state: FSMContext, session_factory, crypto: CryptoPayClient | None):
+async def create_package_invoice(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
+):
     if callback.data == "buy:custom":
         return
     try:
@@ -371,11 +453,18 @@ async def create_package_invoice(callback: CallbackQuery, state: FSMContext, ses
             token_amount,
             Decimal(rubles),
             crypto,
+            platega,
         )
 
 
 @router.message(PurchaseState.waiting_for_token_amount)
-async def create_custom_invoice(message: Message, state: FSMContext, session_factory, crypto: CryptoPayClient | None):
+async def create_custom_invoice(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
+):
     raw_value = (message.text or "").strip()
     if not re.fullmatch(r"[0-9 _]+", raw_value):
         await message.answer("⚠️ Введите целое число, например: <code>25000000</code>")
@@ -391,7 +480,7 @@ async def create_custom_invoice(message: Message, state: FSMContext, session_fac
     await message.answer(
         f"🧮 Рассчитано: <b>{format_tokens(token_amount)}</b> токенов = <b>{format_rubles(rub_amount)} ₽</b>"
     )
-    await offer_payment_methods(message, state, token_amount, rub_amount, crypto)
+    await offer_payment_methods(message, state, token_amount, rub_amount, crypto, platega)
 
 
 @router.callback_query(PurchaseState.choosing_payment_method, F.data.startswith("method:"))
@@ -400,6 +489,7 @@ async def choose_payment_method(
     state: FSMContext,
     session_factory,
     crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
 ):
     data = await state.get_data()
     try:
@@ -428,105 +518,15 @@ async def choose_payment_method(
     if method != "sbp":
         await callback.answer("Неизвестный способ оплаты", show_alert=True)
         return
-
-    with session_factory() as session:
-        link = get_bound_link(session, callback.from_user.id)
-        if link is None:
-            await state.clear()
-            await callback.answer("Сначала откройте покупку с сайта", show_alert=True)
-            return
-        payment = create_manual_payment(
-            session,
-            link,
-            callback.from_user.id,
-            rub_amount,
-            token_amount,
-        )
-    await callback.answer()
-    await state.set_state(PurchaseState.waiting_for_receipt)
-    await state.update_data(manual_payment_id=payment.id)
-    await callback.message.answer(
-        "🏦 <b>Оплата по СБП</b>\n\n"
-        f"💵 Сумма: <b>{format_rubles(rub_amount)} ₽</b>\n"
-        f"📱 Номер: <code>{SBP_PHONE}</code>\n"
-        f"🏛 Банк: <b>{SBP_BANK}</b>\n"
-        f"👤 Получатель: <b>{SBP_RECIPIENT}</b>\n\n"
-        f"💎 После подтверждения будет начислено: <b>{format_tokens(token_amount)}</b> токенов.\n\n"
-        "После успешной оплаты отправьте сюда <b>скриншот чека</b> одним фото или файлом."
-    )
-
-
-@router.message(PurchaseState.waiting_for_receipt)
-async def receive_sbp_receipt(message: Message, state: FSMContext, session_factory, bot: Bot, admin_id: int):
-    data = await state.get_data()
-    try:
-        payment_id = int(data["manual_payment_id"])
-    except (KeyError, ValueError):
-        await state.clear()
-        await message.answer("⚠️ Платёж устарел. Начните оплату заново.")
-        return
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        receipt_type = "photo"
-    elif message.document and (
-        (message.document.mime_type or "").startswith("image/")
-        or message.document.mime_type == "application/pdf"
-    ):
-        file_id = message.document.file_id
-        receipt_type = "document"
-    else:
-        await message.answer("📎 Отправьте чек как фотографию, изображение или PDF-файл.")
-        return
-
-    with session_factory() as session:
-        result, payment = submit_manual_receipt(
-            session,
-            payment_id,
-            message.from_user.id,
-            file_id,
-            receipt_type,
-        )
-    if result != "submitted" or payment is None:
-        await state.clear()
-        await message.answer("⚠️ Этот чек уже отправлен или платёж не найден.")
-        return
-
-    caption = (
-        "🧾 <b>Новая оплата по СБП</b>\n\n"
-        f"Платёж: <code>#{payment.id}</code>\n"
-        f"Telegram: <code>{payment.telegram_user_id}</code>\n"
-        f"Пользователь сайта: <code>#{payment.user_id}</code>\n"
-        f"Сумма: <b>{format_rubles(Decimal(payment.rub_amount))} ₽</b>\n"
-        f"Токены: <b>{format_tokens(payment.token_amount)}</b>"
-    )
-    try:
-        if receipt_type == "photo":
-            sent = await bot.send_photo(
-                admin_id,
-                file_id,
-                caption=caption,
-                reply_markup=receipt_review_keyboard(payment.id),
-            )
-        else:
-            sent = await bot.send_document(
-                admin_id,
-                file_id,
-                caption=caption,
-                reply_markup=receipt_review_keyboard(payment.id),
-            )
-        with session_factory() as session:
-            attach_admin_message(session, payment.id, sent.message_id)
-    except Exception:
-        logger.exception("Could not forward SBP receipt %s to admin", payment.id)
-        await message.answer("⚠️ Чек сохранён, но администратор временно недоступен. Мы повторно проверим платёж.")
-        await state.clear()
-        return
-
+    await callback.answer("⏳ Создаю счёт…")
     await state.clear()
-    await message.answer(
-        "✅ <b>Чек отправлен администратору.</b>\n"
-        "После проверки бот сообщит результат и автоматически начислит токены."
+    await issue_platega_invoice(
+        callback.message,
+        callback.from_user.id,
+        token_amount,
+        rub_amount,
+        session_factory,
+        platega,
     )
 
 
@@ -557,9 +557,9 @@ async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
             f"🔗 Привязано к Telegram: <b>{format_tokens(stats['linked'])}</b>\n"
             f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> оплат · "
             f"<b>{format_rubles(stats['crypto_rub'])} ₽</b>\n"
-            f"🏦 СБП: <b>{stats['sbp_paid']}</b> оплат · "
-            f"<b>{format_rubles(stats['sbp_rub'])} ₽</b>\n"
-            f"⏳ Чеков на проверке: <b>{stats['pending_sbp']}</b>",
+            f"🏦 Platega: <b>{stats['platega_paid']}</b> оплат · "
+            f"<b>{format_rubles(stats['platega_rub'])} ₽</b>\n"
+            f"⏳ Счетов Platega в ожидании: <b>{stats['pending_platega']}</b>",
             reply_markup=admin_keyboard(),
         )
 
@@ -592,19 +592,21 @@ async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id:
         await callback.answer("Нет доступа", show_alert=True)
         return
     with session_factory() as session:
-        payments = recent_manual_payments(session)
+        payments = recent_platega_payments(session)
     status_names = {
-        "awaiting_receipt": "ждём чек",
-        "pending_review": "на проверке",
-        "approved": "одобрен",
-        "rejected": "отклонён",
+        "pending": "ожидает оплату",
+        "confirmed": "оплачен",
+        "canceled": "отменён",
+        "chargebacked": "возврат",
+        "expired": "истёк",
     }
-    lines = ["🧾 <b>Последние платежи СБП</b>", ""]
+    lines = ["🧾 <b>Последние платежи Platega</b>", ""]
     for payment in payments:
         lines.append(
             f"• <code>#{payment.id}</code> · {format_rubles(Decimal(payment.rub_amount))} ₽ · "
             f"{status_names.get(payment.status, payment.status)}\n"
-            f"  TG <code>{payment.telegram_user_id}</code> · {format_tokens(payment.token_amount)} токенов"
+            f"  TG <code>{payment.telegram_user_id}</code> · {format_tokens(payment.token_amount)} токенов\n"
+            f"  Platega <code>{html.escape(payment.transaction_id)}</code>"
         )
     if not payments:
         lines.append("Платежей пока нет.")
@@ -701,64 +703,6 @@ async def admin_broadcast_send(
         )
 
 
-@router.callback_query(F.data.startswith("receipt:"))
-async def review_sbp_receipt(callback: CallbackQuery, session_factory, bot: Bot, admin_id: int):
-    if not is_admin(callback.from_user.id, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    try:
-        _, action, raw_payment_id = callback.data.split(":", 2)
-        payment_id = int(raw_payment_id)
-    except (ValueError, AttributeError):
-        await callback.answer("Некорректный платёж", show_alert=True)
-        return
-    if action not in {"approve", "reject"}:
-        await callback.answer("Некорректное действие", show_alert=True)
-        return
-
-    with session_factory() as session:
-        result, payment, balance = review_manual_payment(
-            session,
-            payment_id,
-            admin_id,
-            approve=action == "approve",
-        )
-    if payment is None:
-        await callback.answer("Платёж не найден", show_alert=True)
-        return
-    if result.startswith("already"):
-        await callback.answer("Платёж уже обработан", show_alert=True)
-        return
-    if result == "not_ready":
-        await callback.answer("Чек ещё не получен", show_alert=True)
-        return
-    if result == "invalid":
-        await callback.answer("Пользователь не найден", show_alert=True)
-        return
-
-    if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    if result == "approved":
-        await callback.answer("Оплата одобрена")
-        await bot.send_message(
-            payment.telegram_user_id,
-            "✅ <b>Оплата по СБП одобрена!</b>\n"
-            f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
-            f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
-        )
-        if callback.message:
-            await callback.message.answer(f"✅ Платёж <code>#{payment.id}</code> одобрен и начислен.")
-    else:
-        await callback.answer("Оплата отклонена")
-        await bot.send_message(
-            payment.telegram_user_id,
-            "❌ <b>Оплата по СБП отклонена.</b>\n"
-            "Если это ошибка, создайте новый платёж и отправьте читаемый чек.",
-        )
-        if callback.message:
-            await callback.message.answer(f"❌ Платёж <code>#{payment.id}</code> отклонён.")
-
-
 @router.callback_query(F.data.startswith("check:"))
 async def check_payment(callback: CallbackQuery, session_factory, crypto: CryptoPayClient | None):
     try:
@@ -788,7 +732,7 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
         )
         return
     except Exception:
-        logger.exception("Unexpected manual payment check failure for invoice %s", invoice_id)
+        logger.exception("Unexpected Crypto Pay check failure for invoice %s", invoice_id)
         await callback.message.answer("⚠️ Не удалось проверить сейчас. Автопроверка повторит попытку через 5 секунд.")
         return
     if invoice is None:
@@ -867,21 +811,83 @@ async def reconcile_pending_payments(bot: Bot, session_factory, crypto: CryptoPa
             logger.exception("Could not notify Telegram user for payment %s", payment.id)
 
 
+def load_pending_platega_payments(session_factory):
+    with session_factory() as session:
+        return get_pending_platega_payments(session)
+
+
+def credit_automatic_platega_payment(session_factory, payment_id: int, transaction: dict):
+    with session_factory() as session:
+        result, payment = credit_verified_platega_payment(session, payment_id, transaction)
+        user = session.get(User, payment.user_id) if payment else None
+        balance = user.token_balance if user else 0
+        return result, payment, balance
+
+
+async def reconcile_pending_platega_payments(
+    bot: Bot,
+    session_factory,
+    platega: PlategaClient,
+) -> None:
+    pending = await asyncio.to_thread(load_pending_platega_payments, session_factory)
+    for pending_payment in pending:
+        try:
+            transaction = await platega.get_transaction(pending_payment.transaction_id)
+        except PlategaError as error:
+            logger.warning(
+                "Platega status check failed for %s: %s",
+                pending_payment.transaction_id,
+                error,
+            )
+            continue
+        result, payment, balance = await asyncio.to_thread(
+            credit_automatic_platega_payment,
+            session_factory,
+            pending_payment.id,
+            transaction,
+        )
+        if result != "credited" or payment is None:
+            continue
+        logger.info(
+            "Automatically credited Platega payment_id=%s transaction_id=%s",
+            payment.id,
+            payment.transaction_id,
+        )
+        try:
+            await bot.send_message(
+                payment.telegram_user_id,
+                "✅ <b>Оплата подтверждена автоматически!</b>\n"
+                f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+            )
+        except Exception:
+            logger.exception("Could not notify Telegram user for Platega payment %s", payment.id)
+
+
 async def payment_reconciliation_loop(
     bot: Bot,
     session_factory,
-    crypto: CryptoPayClient,
+    crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
     stop_event: asyncio.Event,
 ) -> None:
     while not stop_event.is_set():
-        try:
-            await reconcile_pending_payments(bot, session_factory, crypto)
-        except CryptoPayError as error:
-            logger.warning("Automatic Crypto Pay check failed: %s", error)
-        except SQLAlchemyError:
-            logger.exception("Automatic payment database check failed")
-        except Exception:
-            logger.exception("Unexpected automatic payment check failure")
+        if crypto is not None:
+            try:
+                await reconcile_pending_payments(bot, session_factory, crypto)
+            except CryptoPayError as error:
+                logger.warning("Automatic Crypto Pay check failed: %s", error)
+            except SQLAlchemyError:
+                logger.exception("Automatic Crypto Pay database check failed")
+            except Exception:
+                logger.exception("Unexpected automatic Crypto Pay check failure")
+        if platega is not None:
+            try:
+                await reconcile_pending_platega_payments(bot, session_factory, platega)
+            except SQLAlchemyError:
+                logger.exception("Automatic Platega database check failed")
+            except Exception:
+                logger.exception("Unexpected automatic Platega check failure")
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -902,6 +908,10 @@ async def main():
     load_dotenv()
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     crypto_token = os.getenv("CRYPTOBOT_TOKEN", "").strip()
+    platega_merchant_id = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
+    platega_api_key = os.getenv("PLATEGA_API_KEY", "").strip()
+    platega_return_url = os.getenv("PLATEGA_RETURN_URL", "https://t.me/emeraldairobot").strip()
+    platega_failed_url = os.getenv("PLATEGA_FAILED_URL", "https://t.me/emeraldairobot").strip()
     try:
         admin_id = int(os.getenv("ADMIN_ID", str(DEFAULT_ADMIN_ID)).strip())
     except ValueError as error:
@@ -910,10 +920,22 @@ async def main():
         raise RuntimeError("BOT_TOKEN is not configured")
     if crypto_token and bot_token == crypto_token:
         raise RuntimeError("CRYPTOBOT_TOKEN must be a Crypto Pay app token, not BOT_TOKEN")
+    if bool(platega_merchant_id) != bool(platega_api_key):
+        raise RuntimeError("PLATEGA_MERCHANT_ID and PLATEGA_API_KEY must be configured together")
 
     engine, session_factory = database_from_environment()
     await asyncio.to_thread(Base.metadata.create_all, engine)
     crypto = CryptoPayClient(crypto_token) if crypto_token else None
+    platega = (
+        PlategaClient(
+            platega_merchant_id,
+            platega_api_key,
+            platega_return_url,
+            platega_failed_url,
+        )
+        if platega_merchant_id
+        else None
+    )
     if crypto is not None:
         try:
             crypto_app = await crypto.get_me()
@@ -925,7 +947,9 @@ async def main():
             ) from error
         logger.info("Crypto Pay authenticated: app_id=%s name=%s", crypto_app.get("app_id"), crypto_app.get("name"))
     else:
-        logger.warning("CRYPTOBOT_TOKEN is not configured; only SBP payments are available")
+        logger.warning("CRYPTOBOT_TOKEN is not configured; Crypto Bot payments are unavailable")
+    if platega is None:
+        logger.warning("Platega credentials are not configured; SBP payments are unavailable")
 
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
@@ -933,10 +957,10 @@ async def main():
     dispatcher.errors.register(handle_error)
     stop_reconciliation = asyncio.Event()
     reconciliation_task = None
-    if crypto is not None:
+    if crypto is not None or platega is not None:
         reconciliation_task = asyncio.create_task(
-            payment_reconciliation_loop(bot, session_factory, crypto, stop_reconciliation),
-            name="crypto-pay-reconciliation",
+            payment_reconciliation_loop(bot, session_factory, crypto, platega, stop_reconciliation),
+            name="payment-reconciliation",
         )
     try:
         await bot.delete_webhook(drop_pending_updates=False)
@@ -944,6 +968,7 @@ async def main():
             bot,
             session_factory=session_factory,
             crypto=crypto,
+            platega=platega,
             admin_id=admin_id,
             allowed_updates=dispatcher.resolve_used_update_types(),
             close_bot_session=False,
@@ -954,6 +979,8 @@ async def main():
             await reconciliation_task
         if crypto is not None:
             await crypto.close()
+        if platega is not None:
+            await platega.close()
         await bot.session.close()
         engine.dispose()
 

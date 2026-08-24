@@ -1,8 +1,9 @@
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_UP
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
-from database import ManualPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
+from database import PlategaPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
 
 
 PACKAGES = {
@@ -160,83 +161,100 @@ def credit_verified_payment(session, payment_id: int, invoice: dict):
     return "credited", payment
 
 
-def create_manual_payment(
+def get_pending_platega_payments(session, limit: int = 100):
+    now = utcnow()
+    session.execute(
+        update(PlategaPayment)
+        .where(PlategaPayment.status == "pending", PlategaPayment.expires_at <= now)
+        .values(status="expired", last_checked_at=now)
+    )
+    session.commit()
+    return list(session.scalars(
+        select(PlategaPayment)
+        .where(PlategaPayment.status == "pending", PlategaPayment.expires_at > now)
+        .order_by(PlategaPayment.created_at.asc())
+        .limit(limit)
+    ))
+
+
+def create_platega_payment(
     session,
     link: PurchaseLink,
     telegram_user_id: int,
     rub_amount: Decimal,
     token_amount: int,
+    payload: str,
+    transaction: dict,
+    ttl_minutes: int = 60,
 ):
-    payment = ManualPayment(
+    payment = PlategaPayment(
         user_id=link.user_id,
         purchase_link_id=link.id,
         telegram_user_id=telegram_user_id,
+        transaction_id=str(transaction["transactionId"]),
+        payload=payload,
         rub_amount=Decimal(rub_amount),
         token_amount=token_amount,
-        status="awaiting_receipt",
+        status="pending",
+        provider_expires_in=str(transaction.get("expiresIn") or "")[:24] or None,
+        expires_at=utcnow() + timedelta(minutes=ttl_minutes),
     )
     session.add(payment)
     session.commit()
     return payment
 
 
-def submit_manual_receipt(session, payment_id: int, telegram_user_id: int, file_id: str, receipt_type: str):
+def credit_verified_platega_payment(session, payment_id: int, transaction: dict):
     payment = session.execute(
-        select(ManualPayment).where(ManualPayment.id == payment_id).with_for_update()
+        select(PlategaPayment).where(PlategaPayment.id == payment_id).with_for_update()
     ).scalar_one_or_none()
-    if payment is None or payment.telegram_user_id != telegram_user_id:
+    if payment is None:
         return "invalid", None
-    if payment.status != "awaiting_receipt":
+    if payment.status == "confirmed":
         return "already", payment
-    payment.receipt_file_id = file_id
-    payment.receipt_type = receipt_type
-    payment.status = "pending_review"
-    payment.submitted_at = utcnow()
-    session.commit()
-    return "submitted", payment
 
-
-def attach_admin_message(session, payment_id: int, admin_message_id: int):
-    payment = session.get(ManualPayment, payment_id)
-    if payment is None:
-        return None
-    payment.admin_message_id = admin_message_id
-    session.commit()
-    return payment
-
-
-def review_manual_payment(session, payment_id: int, admin_id: int, approve: bool):
-    """Review once under row locks; approved payments credit the balance exactly once."""
-    payment = session.execute(
-        select(ManualPayment).where(ManualPayment.id == payment_id).with_for_update()
-    ).scalar_one_or_none()
-    if payment is None:
-        return "invalid", None, None
-    if payment.status == "approved":
-        user = session.get(User, payment.user_id)
-        return "already_approved", payment, user.token_balance if user else None
-    if payment.status == "rejected":
-        return "already_rejected", payment, None
-    if payment.status != "pending_review":
-        return "not_ready", payment, None
-
-    payment.reviewed_by = admin_id
-    payment.reviewed_at = utcnow()
-    if not approve:
-        payment.status = "rejected"
+    transaction_id = transaction.get("id") or transaction.get("transactionId")
+    status = str(transaction.get("status") or "").upper()
+    details = transaction.get("paymentDetails") or {}
+    valid_identity = (
+        str(transaction_id) == payment.transaction_id
+        and transaction.get("payload") == payment.payload
+    )
+    payment.last_checked_at = utcnow()
+    payment.payment_method = str(transaction.get("paymentMethod") or "")[:32] or None
+    if not valid_identity:
+        session.rollback()
+        return "invalid", payment
+    if status != "CONFIRMED":
+        if status in {"CANCELED", "CHARGEBACKED"}:
+            payment.status = status.lower()
+            session.commit()
+            return payment.status, payment
         session.commit()
-        return "rejected", payment, None
+        return "pending", payment
 
-    user = session.execute(select(User).where(User.id == payment.user_id).with_for_update()).scalar_one_or_none()
+    valid_amount = (
+        str(details.get("currency") or "").upper() == "RUB"
+        and _same_decimal(details.get("amount"), payment.rub_amount)
+    )
+    if not valid_amount:
+        session.rollback()
+        return "invalid", payment
+
+    user = session.execute(
+        select(User).where(User.id == payment.user_id).with_for_update()
+    ).scalar_one_or_none()
     if user is None:
-        return "invalid", payment, None
+        session.rollback()
+        return "invalid", payment
     user.token_balance += payment.token_amount
-    payment.status = "approved"
+    payment.status = "confirmed"
+    payment.paid_at = utcnow()
     apply_first_topup_referral_reward(
-        session, user.id, payment.token_amount, "sbp", payment.id
+        session, user.id, payment.token_amount, "platega", payment.id
     )
     session.commit()
-    return "approved", payment, user.token_balance
+    return "credited", payment
 
 
 def admin_statistics(session):
@@ -250,23 +268,24 @@ def admin_statistics(session):
     crypto_rub = session.scalar(
         select(func.coalesce(func.sum(TokenPayment.rub_amount), 0)).where(TokenPayment.status == "paid")
     ) or 0
-    sbp_paid = session.scalar(
-        select(func.count(ManualPayment.id)).where(ManualPayment.status == "approved")
+    platega_paid = session.scalar(
+        select(func.count(PlategaPayment.id)).where(PlategaPayment.status == "confirmed")
     ) or 0
-    sbp_rub = session.scalar(
-        select(func.coalesce(func.sum(ManualPayment.rub_amount), 0)).where(ManualPayment.status == "approved")
+    platega_rub = session.scalar(
+        select(func.coalesce(func.sum(PlategaPayment.rub_amount), 0))
+        .where(PlategaPayment.status == "confirmed")
     ) or 0
-    pending_sbp = session.scalar(
-        select(func.count(ManualPayment.id)).where(ManualPayment.status == "pending_review")
+    pending_platega = session.scalar(
+        select(func.count(PlategaPayment.id)).where(PlategaPayment.status == "pending")
     ) or 0
     return {
         "users": int(users),
         "linked": int(linked),
         "crypto_paid": int(crypto_paid),
         "crypto_rub": Decimal(crypto_rub),
-        "sbp_paid": int(sbp_paid),
-        "sbp_rub": Decimal(sbp_rub),
-        "pending_sbp": int(pending_sbp),
+        "platega_paid": int(platega_paid),
+        "platega_rub": Decimal(platega_rub),
+        "pending_platega": int(pending_platega),
     }
 
 
@@ -287,7 +306,7 @@ def broadcast_recipients(session):
     ))
 
 
-def recent_manual_payments(session, limit: int = 20):
+def recent_platega_payments(session, limit: int = 20):
     return list(session.scalars(
-        select(ManualPayment).order_by(ManualPayment.created_at.desc()).limit(limit)
+        select(PlategaPayment).order_by(PlategaPayment.created_at.desc()).limit(limit)
     ))

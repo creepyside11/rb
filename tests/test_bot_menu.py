@@ -1,13 +1,13 @@
 import unittest
 
 from bot import (
-    PAYMENT_ANNOUNCEMENT,
     PRIVACY_POLICY_URL,
     SUPPORT_URL,
     USER_AGREEMENT_URL,
     balance_text,
     main_menu_keyboard,
     package_keyboard,
+    payment_method_keyboard,
 )
 
 
@@ -21,11 +21,21 @@ class BotMenuTest(unittest.TestCase):
         self.assertEqual(by_text["📄 Пользовательское соглашение"].url, USER_AGREEMENT_URL)
         self.assertEqual(by_text["🔒 Политика конфиденциальности"].url, PRIVACY_POLICY_URL)
 
-    def test_balance_contains_payment_announcement(self):
+    def test_balance_has_no_old_platega_announcement(self):
         text = balance_text(25_000_000)
 
         self.assertIn("25 000 000", text)
-        self.assertIn(PAYMENT_ANNOUNCEMENT, text)
+        self.assertNotIn("Скоро", text)
+
+    def test_sbp_button_uses_automatic_platega_flow(self):
+        buttons = [
+            button
+            for row in payment_method_keyboard(crypto_available=False, platega_available=True).inline_keyboard
+            for button in row
+        ]
+        by_callback = {button.callback_data: button for button in buttons if button.callback_data}
+
+        self.assertEqual(by_callback["method:sbp"].text, "🏦 СБП · автоматически")
 
     def test_package_menu_can_return_to_main_menu(self):
         callbacks = {

@@ -86,10 +86,10 @@ class TokenPayment(Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class ManualPayment(Base):
-    """SBP payment reviewed by an administrator from inside Telegram."""
+class PlategaPayment(Base):
+    """Automatically reconciled Platega payment-link transaction."""
 
-    __tablename__ = "manual_token_payments"
+    __tablename__ = "platega_token_payments"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -97,16 +97,17 @@ class ManualPayment(Base):
         ForeignKey("purchase_links.id", ondelete="CASCADE"), nullable=False, index=True
     )
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    transaction_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    payload: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
     rub_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    status: Mapped[str] = mapped_column(String(24), nullable=False, default="awaiting_receipt", index=True)
-    receipt_file_id: Mapped[str | None] = mapped_column(String(255))
-    receipt_type: Mapped[str | None] = mapped_column(String(16))
-    admin_message_id: Mapped[int | None] = mapped_column(BigInteger)
-    reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    payment_method: Mapped[str | None] = mapped_column(String(32))
+    provider_expires_in: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
-    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ReferralCode(Base):

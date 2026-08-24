@@ -10,8 +10,10 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.filters.command import CommandObject
+from aiogram.methods.base import TelegramMethod
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -71,6 +73,17 @@ class AdminState(StatesGroup):
     waiting_for_token_price = State()
 
 
+class SendRichMessage(TelegramMethod[Message]):
+    """Bot API 10.3 method; remove when aiogram ships its native wrapper."""
+
+    __returning__ = Message
+    __api_method__ = "sendRichMessage"
+
+    chat_id: int | str
+    rich_message: dict[str, Any]
+    reply_markup: InlineKeyboardMarkup | None = None
+
+
 def format_tokens(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -81,12 +94,39 @@ def format_rubles(value: Decimal) -> str:
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить токены", callback_data="show:packages")],
-        [InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")],
-        [InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL)],
-        [InlineKeyboardButton(text="📄 Пользовательское соглашение", url=USER_AGREEMENT_URL)],
-        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=PRIVACY_POLICY_URL)],
+        [InlineKeyboardButton(text="💎 Купить токены", callback_data="show:packages", style="primary")],
+        [InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance", style="success")],
+        [InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL, style="primary")],
+        [InlineKeyboardButton(text="📄 Пользовательское соглашение", url=USER_AGREEMENT_URL, style="primary")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=PRIVACY_POLICY_URL, style="primary")],
     ])
+
+
+def main_menu_links_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=main_menu_keyboard().inline_keyboard[2:])
+
+
+def main_menu_rich_html(text: str) -> str:
+    return (
+        f"<p>{text}</p>"
+        '<tg-button-row align="center">'
+        '<tg-button type="callback_data" style="primary" data="show:packages">💎 Купить токены</tg-button>'
+        '<tg-button type="callback_data" style="success" data="show:balance">💰 Баланс</tg-button>'
+        "</tg-button-row>"
+    )
+
+
+async def send_main_menu(bot: Bot, chat_id: int, text: str) -> Message:
+    """Send actions inside the message, with a regular-message compatibility fallback."""
+    try:
+        return await bot(SendRichMessage(
+            chat_id=chat_id,
+            rich_message={"html": main_menu_rich_html(text)},
+            reply_markup=main_menu_links_keyboard(),
+        ))
+    except TelegramAPIError:
+        logger.warning("sendRichMessage is unavailable; using a regular menu", exc_info=True)
+        return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
 
 
 def balance_text(amount: int) -> str:
@@ -103,12 +143,13 @@ def package_keyboard(
                 f"{format_rubles(tokens_to_rubles(tokens, price_per_million))} ₽"
             ),
             callback_data=f"buy:{package_id}",
+            style="primary",
         )]
         for package_id, tokens in PACKAGES.items()
     ]
-    rows.append([InlineKeyboardButton(text="✍️ Ввести своё количество", callback_data="buy:custom")])
-    rows.append([InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu")])
+    rows.append([InlineKeyboardButton(text="✍️ Ввести своё количество", callback_data="buy:custom", style="primary")])
+    rows.append([InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance", style="success")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -118,24 +159,32 @@ def payment_method_keyboard(
 ) -> InlineKeyboardMarkup:
     rows = []
     if crypto_available:
-        rows.append([InlineKeyboardButton(text="💎 Crypto Bot · автоматически", callback_data="method:crypto")])
+        rows.append([InlineKeyboardButton(
+            text="💎 Crypto Bot · автоматически",
+            callback_data="method:crypto",
+            style="success",
+        )])
     if platega_available:
-        rows.append([InlineKeyboardButton(text="🏦 СБП Платега · автоматически", callback_data="method:platega")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages")])
+        rows.append([InlineKeyboardButton(
+            text="🏦 СБП Платега · автоматически",
+            callback_data="method:platega",
+            style="success",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
-            InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats", style="primary"),
+            InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price", style="primary"),
         ],
-        [InlineKeyboardButton(text="🌐 Пользователи сайта", callback_data="admin:site_users")],
-        [InlineKeyboardButton(text="🤖 Пользователи бота", callback_data="admin:bot_users")],
+        [InlineKeyboardButton(text="🌐 Пользователи сайта", callback_data="admin:site_users", style="primary")],
+        [InlineKeyboardButton(text="🤖 Пользователи бота", callback_data="admin:bot_users", style="primary")],
         [
-            InlineKeyboardButton(text="🧾 Платежи СБП Платега", callback_data="admin:payments"),
-            InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast"),
+            InlineKeyboardButton(text="🧾 Платежи СБП Платега", callback_data="admin:payments", style="success"),
+            InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast", style="primary"),
         ],
     ])
 
@@ -151,8 +200,9 @@ def admin_site_users_keyboard(rows) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(
             text=f"🌐 {name} · #{user.id}",
             callback_data=f"admin:site_user:{user.id}",
+            style="primary",
         )])
-    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -169,16 +219,17 @@ def admin_bot_users_keyboard(rows) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(
             text=f"🤖 {bot_user_title(profile)[:32]}",
             callback_data=f"admin:bot_user:{profile.telegram_user_id}",
+            style="primary",
         )])
-    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def admin_user_detail_keyboard(back_callback: str, username: str | None = None) -> InlineKeyboardMarkup:
     rows = []
     if username and re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
-        rows.append([InlineKeyboardButton(text=f"↗️ Открыть @{username}", url=f"https://t.me/{username}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_callback)])
+        rows.append([InlineKeyboardButton(text=f"↗️ Открыть @{username}", url=f"https://t.me/{username}", style="primary")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_callback, style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -236,16 +287,16 @@ class BotUserTrackingMiddleware(BaseMiddleware):
 
 def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить в Crypto Bot", url=payment_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check:{payment_id}")],
-        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages")],
+        [InlineKeyboardButton(text="💳 Оплатить в Crypto Bot", url=payment_url, style="success")],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check:{payment_id}", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages", style="primary")],
     ])
 
 
 def platega_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏦 Оплатить через СБП Платега", url=payment_url)],
-        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages")],
+        [InlineKeyboardButton(text="🏦 Оплатить через СБП Платега", url=payment_url, style="success")],
+        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages", style="primary")],
     ])
 
 
@@ -319,12 +370,13 @@ async def start(
         user = session.get(User, link.user_id)
         balance = user.token_balance if user else 0
         token_price = get_token_price(session)
-    await message.answer(
+    await send_main_menu(
+        message.bot,
+        message.chat.id,
         "💚 <b>Emerald AI</b>\n\n"
         f"💎 Курс: <b>1 000 000 токенов = {format_rubles(token_price)} ₽</b>\n"
         f"{balance_text(balance)}\n\n"
         "Выберите действие:",
-        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -348,7 +400,7 @@ async def show_balance(callback: CallbackQuery, session_factory):
         text = "🔗 Сначала откройте покупку с сайта."
         if amount is not None:
             text = balance_text(amount)
-        await callback.message.answer(text, reply_markup=main_menu_keyboard())
+        await send_main_menu(callback.bot, callback.message.chat.id, text)
 
 
 @router.callback_query(F.data == "show:menu")
@@ -360,7 +412,7 @@ async def show_main_menu(callback: CallbackQuery, state: FSMContext, session_fac
         text = "💚 <b>Emerald AI</b>\n\nВыберите действие:"
         if amount is not None:
             text = f"💚 <b>Emerald AI</b>\n\n{balance_text(amount)}\n\nВыберите действие:"
-        await callback.message.answer(text, reply_markup=main_menu_keyboard())
+        await send_main_menu(callback.bot, callback.message.chat.id, text)
 
 
 @router.callback_query(F.data == "show:packages")
@@ -938,8 +990,8 @@ async def admin_broadcast_preview(message: Message, state: FSMContext, admin_id:
     await message.answer(
         "👀 Сообщение принято. Запустить рассылку всем привязанным пользователям?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🚀 Отправить", callback_data="broadcast:confirm"),
-            InlineKeyboardButton(text="✖️ Отмена", callback_data="broadcast:cancel"),
+            InlineKeyboardButton(text="🚀 Отправить", callback_data="broadcast:confirm", style="success"),
+            InlineKeyboardButton(text="✖️ Отмена", callback_data="broadcast:cancel", style="danger"),
         ]]),
     )
 

@@ -2,7 +2,7 @@
 
 Telegram worker for `@emeraldairobot`, built on aiogram 3. It accepts only personal links created by the Emerald AI account dashboard and supports automatic Crypto Bot and Platega payments.
 
-Users can select a ready-made package or enter an exact token amount. The rate is 1,000,000 tokens per ₽1; fractional prices are rounded up to one kopeck and shown before invoice creation.
+Users can select a ready-made package or enter an exact token amount. The administrator can change the RUB price per 1,000,000 tokens from `/admin`; the setting is stored in the database and applies immediately to packages and custom amounts. Fractional totals are rounded up to one kopeck and shown before invoice creation.
 
 Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation. The Platega flow never asks for a receipt or an administrator approval.
 
@@ -33,7 +33,7 @@ ADMIN_ID=7973988177
 
 Set the invoice lifetime to **60 minutes** in the Platega merchant settings. The public [create-payment-link API](https://docs.platega.io/%D1%81%D0%BE%D0%B7%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5-%D0%BF%D0%BB%D0%B0%D1%82%D0%B5%D0%B6%D0%BD%D0%BE%D0%B9-%D1%81%D1%81%D1%8B%D0%BB%D0%BA%D0%B8-%D0%B1%D0%B5%D0%B7-%D0%B7%D0%B0%D0%B4%D0%B0%D0%BD%D0%BD%D0%BE%D0%B3%D0%BE-%D0%BC%D0%B5%D1%82%D0%BE%D0%B4%D0%B0-33845703e0) returns `expiresIn` but does not accept a lifetime field. The worker also stops polling and marks its local payment expired after 60 minutes; it logs a warning when the provider returns a different lifetime.
 
-`ADMIN_ID` is the only Telegram account allowed to open `/admin`, inspect Crypto Bot and Platega statistics and transactions, inspect users, and run broadcasts. If omitted, the configured default is `7973988177`.
+`ADMIN_ID` is the only Telegram account allowed to open `/admin`, inspect Crypto Bot and Platega statistics and transactions, browse separate clickable website-user and Telegram-bot-user lists, change the token price, and run broadcasts. Telegram usernames and names are refreshed whenever a user interacts with the bot. If omitted, the configured default is `7973988177`.
 
 ## Run
 

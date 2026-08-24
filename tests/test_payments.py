@@ -4,16 +4,24 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import Base, PlategaPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
+from database import Base, BotUser, PlategaPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
 from cryptopay import CryptoPayClient, CryptoPayError
 from payments import (
     admin_statistics,
+    admin_bot_user,
+    admin_bot_users,
+    admin_site_user,
+    admin_site_users,
+    backfill_bound_bot_users,
     bind_purchase_link,
     create_platega_payment,
     credit_verified_platega_payment,
     credit_verified_payment,
     get_pending_platega_payments,
+    get_token_price,
+    set_token_price,
     tokens_to_rubles,
+    upsert_bot_user,
 )
 
 
@@ -38,6 +46,63 @@ class PaymentTest(unittest.TestCase):
     def test_custom_token_amount_is_converted_at_one_million_per_ruble(self):
         self.assertEqual(tokens_to_rubles(25_000_000), Decimal("25.00"))
         self.assertEqual(tokens_to_rubles(1_000_001), Decimal("1.01"))
+
+    def test_admin_price_is_persistent_and_used_for_all_amounts(self):
+        with self.Session() as session:
+            self.assertEqual(get_token_price(session), Decimal("1.00"))
+            stored = set_token_price(session, "2,50")
+        with self.Session() as session:
+            loaded = get_token_price(session)
+
+        self.assertEqual(stored, Decimal("2.50"))
+        self.assertEqual(loaded, Decimal("2.50"))
+        self.assertEqual(tokens_to_rubles(10_000_000, loaded), Decimal("25.00"))
+
+    def test_invalid_admin_price_is_rejected(self):
+        with self.Session() as session:
+            with self.assertRaises(ValueError):
+                set_token_price(session, "0")
+            with self.assertRaises(ValueError):
+                set_token_price(session, "not-a-number")
+
+    def test_bot_profiles_and_site_users_are_listed_separately(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            link.telegram_user_id = 101
+            upsert_bot_user(session, 101, "first_username", "First", "User")
+            updated = upsert_bot_user(session, 101, "new_username", "New", "Name")
+            session.add(BotUser(
+                telegram_user_id=202,
+                username=None,
+                first_name="Bot only",
+                last_seen_at=utcnow(),
+            ))
+            session.commit()
+
+            site_rows = admin_site_users(session)
+            bot_rows = admin_bot_users(session)
+            site_row = admin_site_user(session, 1)
+            bot_row = admin_bot_user(session, 101)
+
+        self.assertEqual(updated.username, "new_username")
+        self.assertEqual(len(site_rows), 1)
+        self.assertEqual(len(bot_rows), 2)
+        self.assertEqual(site_row[0].email, "test@example.com")
+        self.assertEqual(site_row[2].username, "new_username")
+        self.assertEqual(bot_row[0].telegram_user_id, 101)
+        self.assertEqual(bot_row[2].id, 1)
+
+    def test_existing_bound_telegram_users_are_backfilled(self):
+        with self.Session() as session:
+            session.get(PurchaseLink, 1).telegram_user_id = 303
+            session.commit()
+            created = backfill_bound_bot_users(session)
+            repeated = backfill_bound_bot_users(session)
+            profile = session.get(BotUser, 303)
+
+        self.assertEqual(created, 1)
+        self.assertEqual(repeated, 0)
+        self.assertIsNotNone(profile)
 
     def test_get_invoices_accepts_documented_and_wrapped_responses(self):
         invoice = {"invoice_id": 77, "status": "paid"}

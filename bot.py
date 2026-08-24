@@ -5,8 +5,9 @@ import os
 import re
 import secrets
 from decimal import Decimal
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -24,8 +25,13 @@ from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
     PACKAGES,
+    DEFAULT_TOKEN_PRICE_PER_MILLION,
+    admin_bot_user,
+    admin_bot_users,
+    admin_site_user,
+    admin_site_users,
     admin_statistics,
-    admin_users,
+    backfill_bound_bot_users,
     bind_purchase_link,
     broadcast_recipients,
     create_platega_payment,
@@ -36,7 +42,10 @@ from payments import (
     get_pending_platega_payments,
     recent_platega_payments,
     save_pending_payment,
+    set_token_price,
+    get_token_price,
     tokens_to_rubles,
+    upsert_bot_user,
 )
 
 
@@ -59,6 +68,7 @@ class PurchaseState(StatesGroup):
 class AdminState(StatesGroup):
     waiting_for_broadcast = State()
     confirming_broadcast = State()
+    waiting_for_token_price = State()
 
 
 def format_tokens(value: int) -> str:
@@ -83,13 +93,18 @@ def balance_text(amount: int) -> str:
     return f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов"
 
 
-def package_keyboard() -> InlineKeyboardMarkup:
+def package_keyboard(
+    price_per_million: Decimal = DEFAULT_TOKEN_PRICE_PER_MILLION,
+) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
-            text=f"💎 {format_tokens(tokens)} токенов · {rub} ₽",
-            callback_data=f"buy:{rub}",
+            text=(
+                f"💎 {format_tokens(tokens)} токенов · "
+                f"{format_rubles(tokens_to_rubles(tokens, price_per_million))} ₽"
+            ),
+            callback_data=f"buy:{package_id}",
         )]
-        for rub, tokens in PACKAGES.items()
+        for package_id, tokens in PACKAGES.items()
     ]
     rows.append([InlineKeyboardButton(text="✍️ Ввести своё количество", callback_data="buy:custom")])
     rows.append([InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance")])
@@ -114,8 +129,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
-            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
+            InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price"),
         ],
+        [InlineKeyboardButton(text="🌐 Пользователи сайта", callback_data="admin:site_users")],
+        [InlineKeyboardButton(text="🤖 Пользователи бота", callback_data="admin:bot_users")],
         [
             InlineKeyboardButton(text="🧾 Платежи СБП Платега", callback_data="admin:payments"),
             InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast"),
@@ -125,6 +142,96 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 
 def is_admin(telegram_user_id: int, admin_id: int) -> bool:
     return telegram_user_id == admin_id
+
+
+def admin_site_users_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+    for user, _link, _bot_user in rows:
+        name = " ".join((user.name or "Без имени").split())[:28]
+        buttons.append([InlineKeyboardButton(
+            text=f"🌐 {name} · #{user.id}",
+            callback_data=f"admin:site_user:{user.id}",
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def bot_user_title(profile) -> str:
+    if profile.username:
+        return f"@{profile.username}"
+    full_name = " ".join(filter(None, [profile.first_name, profile.last_name])).strip()
+    return full_name or str(profile.telegram_user_id)
+
+
+def admin_bot_users_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+    for profile, _link, _site_user in rows:
+        buttons.append([InlineKeyboardButton(
+            text=f"🤖 {bot_user_title(profile)[:32]}",
+            callback_data=f"admin:bot_user:{profile.telegram_user_id}",
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_user_detail_keyboard(back_callback: str, username: str | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    if username and re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        rows.append([InlineKeyboardButton(text=f"↗️ Открыть @{username}", url=f"https://t.me/{username}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def save_bot_profile(session_factory, profile) -> None:
+    with session_factory() as session:
+        upsert_bot_user(
+            session,
+            profile.id,
+            profile.username,
+            profile.first_name,
+            profile.last_name,
+        )
+
+
+def initialize_bot_records(session_factory) -> None:
+    with session_factory() as session:
+        backfill_bound_bot_users(session)
+
+
+async def refresh_missing_bot_profiles(bot: Bot, session_factory, profiles) -> None:
+    semaphore = asyncio.Semaphore(5)
+
+    async def refresh(profile) -> None:
+        if profile.first_name is not None:
+            return
+        try:
+            async with semaphore:
+                telegram_profile = await bot.get_chat(profile.telegram_user_id)
+            await asyncio.to_thread(save_bot_profile, session_factory, telegram_profile)
+        except Exception:
+            logger.info(
+                "Could not refresh Telegram profile for user_id=%s",
+                profile.telegram_user_id,
+            )
+
+    await asyncio.gather(*(refresh(profile) for profile in profiles))
+
+
+class BotUserTrackingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: dict[str, Any],
+    ) -> Any:
+        profile = data.get("event_from_user")
+        session_factory = data.get("session_factory")
+        if profile is not None and session_factory is not None:
+            try:
+                await asyncio.to_thread(save_bot_profile, session_factory, profile)
+            except SQLAlchemyError:
+                logger.exception("Could not save Telegram profile for user_id=%s", profile.id)
+        return await handler(event, data)
 
 
 def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
@@ -174,6 +281,11 @@ def read_balance(session_factory, telegram_user_id: int):
         return user.token_balance if user else None
 
 
+def read_token_price(session_factory) -> Decimal:
+    with session_factory() as session:
+        return get_token_price(session)
+
+
 @router.message(CommandStart())
 async def start(
     message: Message,
@@ -206,9 +318,10 @@ async def start(
             return
         user = session.get(User, link.user_id)
         balance = user.token_balance if user else 0
+        token_price = get_token_price(session)
     await message.answer(
         "💚 <b>Emerald AI</b>\n\n"
-        "💎 Курс: <b>1 000 000 токенов = 1 ₽</b>\n"
+        f"💎 Курс: <b>1 000 000 токенов = {format_rubles(token_price)} ₽</b>\n"
         f"{balance_text(balance)}\n\n"
         "Выберите действие:",
         reply_markup=main_menu_keyboard(),
@@ -255,6 +368,7 @@ async def show_packages(callback: CallbackQuery, state: FSMContext, session_fact
     await state.clear()
     with session_factory() as session:
         link = get_bound_link(session, callback.from_user.id)
+        token_price = get_token_price(session)
     if link is None:
         await callback.answer(
             "Сначала откройте покупку по персональной ссылке из кабинета Emerald AI.",
@@ -263,7 +377,10 @@ async def show_packages(callback: CallbackQuery, state: FSMContext, session_fact
         return
     await callback.answer()
     if callback.message:
-        await callback.message.answer("💎 Выберите пакет:", reply_markup=package_keyboard())
+        await callback.message.answer(
+            f"💎 Выберите пакет:\n\nКурс: <b>1 000 000 = {format_rubles(token_price)} ₽</b>",
+            reply_markup=package_keyboard(token_price),
+        )
 
 
 @router.callback_query(F.data == "buy:custom")
@@ -286,9 +403,19 @@ async def request_custom_amount(callback: CallbackQuery, state: FSMContext, sess
 
 
 @router.message(Command("cancel"))
-async def cancel_custom_amount(message: Message, state: FSMContext):
+async def cancel_custom_amount(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    current_state = await state.get_state()
     await state.clear()
-    await message.answer("↩️ Ввод отменён.", reply_markup=package_keyboard())
+    if is_admin(message.from_user.id, admin_id) and current_state and current_state.startswith("AdminState:"):
+        await message.answer("↩️ Действие отменено.", reply_markup=admin_keyboard())
+        return
+    token_price = read_token_price(session_factory)
+    await message.answer("↩️ Ввод отменён.", reply_markup=package_keyboard(token_price))
 
 
 async def issue_invoice(
@@ -440,18 +567,19 @@ async def create_package_invoice(
     if callback.data == "buy:custom":
         return
     try:
-        rubles = int(callback.data.split(":", 1)[1])
-        token_amount = PACKAGES[rubles]
+        package_id = int(callback.data.split(":", 1)[1])
+        token_amount = PACKAGES[package_id]
     except (ValueError, IndexError, KeyError, AttributeError):
         await callback.answer("❌ Некорректный пакет", show_alert=True)
         return
     await callback.answer()
     if callback.message:
+        token_price = read_token_price(session_factory)
         await offer_payment_methods(
             callback.message,
             state,
             token_amount,
-            Decimal(rubles),
+            tokens_to_rubles(token_amount, token_price),
             crypto,
             platega,
         )
@@ -476,7 +604,8 @@ async def create_custom_invoice(
     if token_amount > MAX_TOKEN_AMOUNT:
         await message.answer(f"⚠️ Максимум — <b>{format_tokens(MAX_TOKEN_AMOUNT)}</b> токенов.")
         return
-    rub_amount = tokens_to_rubles(token_amount)
+    token_price = read_token_price(session_factory)
+    rub_amount = tokens_to_rubles(token_amount, token_price)
     await message.answer(
         f"🧮 Рассчитано: <b>{format_tokens(token_amount)}</b> токенов = <b>{format_rubles(rub_amount)} ₽</b>"
     )
@@ -545,6 +674,20 @@ async def admin_panel(message: Message, state: FSMContext, admin_id: int):
     )
 
 
+@router.callback_query(F.data == "admin:home")
+async def admin_home(callback: CallbackQuery, state: FSMContext, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🛡 <b>Админ-панель Emerald AI</b>",
+            reply_markup=admin_keyboard(),
+        )
+
+
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
     if not is_admin(callback.from_user.id, admin_id):
@@ -557,6 +700,7 @@ async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
         await callback.message.answer(
             "📊 <b>Статистика</b>\n\n"
             f"👥 Пользователей сайта: <b>{format_tokens(stats['users'])}</b>\n"
+            f"🤖 Пользователей бота: <b>{format_tokens(stats['bot_users'])}</b>\n"
             f"🔗 Привязано к Telegram: <b>{format_tokens(stats['linked'])}</b>\n"
             f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> оплат · "
             f"<b>{format_rubles(stats['crypto_rub'])} ₽</b>\n"
@@ -567,26 +711,177 @@ async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
         )
 
 
-@router.callback_query(F.data == "admin:users")
-async def admin_user_list(callback: CallbackQuery, session_factory, admin_id: int):
+@router.callback_query(F.data.in_({"admin:site_users", "admin:users"}))
+async def admin_site_user_list(callback: CallbackQuery, session_factory, admin_id: int):
     if not is_admin(callback.from_user.id, admin_id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     with session_factory() as session:
-        users = admin_users(session)
-    lines = ["👥 <b>Последние пользователи</b>", ""]
-    for user, telegram_id in users:
-        telegram = f"<code>{telegram_id}</code>" if telegram_id else "не привязан"
-        lines.append(
-            f"• <b>{html.escape(user.name[:40])}</b> · <code>#{user.id}</code>\n"
-            f"  {html.escape(user.email[:55])} · TG {telegram}\n"
-            f"  Баланс: <b>{format_tokens(user.token_balance)}</b>"
-        )
-    if not users:
-        lines.append("Пользователей пока нет.")
+        users = admin_site_users(session)
     await callback.answer()
     if callback.message:
-        await callback.message.answer("\n".join(lines), reply_markup=admin_keyboard())
+        await callback.message.answer(
+            "🌐 <b>Пользователи сайта</b>\n\nНажмите на пользователя, чтобы открыть карточку.",
+            reply_markup=admin_site_users_keyboard(users),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:site_user:"))
+async def admin_site_user_details(
+    callback: CallbackQuery,
+    session_factory,
+    bot: Bot,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        user_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        row = admin_site_user(session, user_id)
+    if row is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    user, link, profile = row
+    if profile is not None and profile.first_name is None:
+        await refresh_missing_bot_profiles(bot, session_factory, [profile])
+        with session_factory() as session:
+            row = admin_site_user(session, user_id)
+        user, link, profile = row
+    telegram_id = link.telegram_user_id if link else None
+    username = profile.username if profile else None
+    telegram_name = bot_user_title(profile) if profile else "профиль ещё не сохранён"
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🌐 <b>Пользователь сайта</b>\n\n"
+            f"ID: <code>{user.id}</code>\n"
+            f"Имя: <b>{html.escape(user.name)}</b>\n"
+            f"Email: <code>{html.escape(user.email)}</code>\n"
+            f"Баланс: <b>{format_tokens(user.token_balance)}</b> токенов\n"
+            f"Telegram ID: {f'<code>{telegram_id}</code>' if telegram_id else 'не привязан'}\n"
+            f"Telegram: <b>{html.escape(telegram_name)}</b>",
+            reply_markup=admin_user_detail_keyboard("admin:site_users", username),
+        )
+
+
+@router.callback_query(F.data == "admin:bot_users")
+async def admin_bot_user_list(
+    callback: CallbackQuery,
+    session_factory,
+    bot: Bot,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        users = admin_bot_users(session)
+    await refresh_missing_bot_profiles(bot, session_factory, [row[0] for row in users])
+    with session_factory() as session:
+        users = admin_bot_users(session)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🤖 <b>Пользователи бота</b>\n\nНажмите на пользователя, чтобы открыть карточку.",
+            reply_markup=admin_bot_users_keyboard(users),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:bot_user:"))
+async def admin_bot_user_details(
+    callback: CallbackQuery,
+    session_factory,
+    bot: Bot,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        telegram_user_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        row = admin_bot_user(session, telegram_user_id)
+    if row is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    profile, _link, site_user = row
+    if profile.first_name is None:
+        await refresh_missing_bot_profiles(bot, session_factory, [profile])
+        with session_factory() as session:
+            row = admin_bot_user(session, telegram_user_id)
+        profile, _link, site_user = row
+    username = f"@{profile.username}" if profile.username else "не указан"
+    full_name = " ".join(filter(None, [profile.first_name, profile.last_name])) or "не указано"
+    site_account = (
+        f"<b>{html.escape(site_user.name)}</b> · <code>#{site_user.id}</code>"
+        if site_user else "не привязан"
+    )
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🤖 <b>Пользователь бота</b>\n\n"
+            f"Telegram ID: <code>{profile.telegram_user_id}</code>\n"
+            f"Username: <b>{html.escape(username)}</b>\n"
+            f"Имя: <b>{html.escape(full_name)}</b>\n"
+            f"Аккаунт сайта: {site_account}\n"
+            f"Последняя активность: <code>{profile.last_seen_at:%Y-%m-%d %H:%M UTC}</code>",
+            reply_markup=admin_user_detail_keyboard("admin:bot_users", profile.username),
+        )
+
+
+@router.callback_query(F.data == "admin:price")
+async def admin_price_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    token_price = read_token_price(session_factory)
+    await state.set_state(AdminState.waiting_for_token_price)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "💵 <b>Цена за 1 000 000 токенов</b>\n\n"
+            f"Текущая цена: <b>{format_rubles(token_price)} ₽</b>\n"
+            "Отправьте новую цену в рублях, например: <code>1.50</code>\n"
+            "Минимум — 0,01 ₽. Для отмены отправьте /cancel."
+        )
+
+
+@router.message(AdminState.waiting_for_token_price)
+async def admin_price_save(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    try:
+        with session_factory() as session:
+            token_price = set_token_price(session, message.text or "")
+    except ValueError as error:
+        await message.answer(f"⚠️ {html.escape(str(error))}. Введите цену ещё раз.")
+        return
+    await state.clear()
+    await message.answer(
+        "✅ <b>Цена обновлена</b>\n\n"
+        f"1 000 000 токенов = <b>{format_rubles(token_price)} ₽</b>\n"
+        "Новая цена уже применяется ко всем пакетам и произвольным покупкам.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "admin:payments")
@@ -928,6 +1223,7 @@ async def main():
 
     engine, session_factory = database_from_environment()
     await asyncio.to_thread(Base.metadata.create_all, engine)
+    await asyncio.to_thread(initialize_bot_records, session_factory)
     crypto = CryptoPayClient(crypto_token) if crypto_token else None
     platega = (
         PlategaClient(
@@ -956,6 +1252,7 @@ async def main():
 
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(BotUserTrackingMiddleware())
     dispatcher.include_router(router)
     dispatcher.errors.register(handle_error)
     stop_reconciliation = asyncio.Event()

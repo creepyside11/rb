@@ -1,4 +1,5 @@
 import unittest
+from decimal import Decimal
 
 from bot import (
     PRIVACY_POLICY_URL,
@@ -54,6 +55,20 @@ class BotMenuTest(unittest.TestCase):
             by_callback["admin:payments"].text,
             "🧾 Платежи СБП Платега",
         )
+        self.assertEqual(by_callback["admin:site_users"].text, "🌐 Пользователи сайта")
+        self.assertEqual(by_callback["admin:bot_users"].text, "🤖 Пользователи бота")
+        self.assertEqual(by_callback["admin:price"].text, "💵 Цена токенов")
+
+    def test_package_menu_uses_configured_price(self):
+        buttons = [
+            button
+            for row in package_keyboard(Decimal("2.50")).inline_keyboard
+            for button in row
+        ]
+        by_callback = {button.callback_data: button for button in buttons if button.callback_data}
+
+        self.assertIn("2.5 ₽", by_callback["buy:1"].text)
+        self.assertIn("25 ₽", by_callback["buy:10"].text)
 
     def test_package_menu_can_return_to_main_menu(self):
         callbacks = {

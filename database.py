@@ -66,6 +66,29 @@ class PurchaseLink(Base):
     last_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class BotUser(Base):
+    """Telegram profiles seen by the bot, independent from website accounts."""
+
+    __tablename__ = "telegram_bot_users"
+
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(64), index=True)
+    first_name: Mapped[str | None] = mapped_column(String(128))
+    last_name: Mapped[str | None] = mapped_column(String(128))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class BotSetting(Base):
+    """Persistent bot settings editable from the Telegram admin panel."""
+
+    __tablename__ = "telegram_bot_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class TokenPayment(Base):
     __tablename__ = "token_payments"
 

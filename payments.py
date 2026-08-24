@@ -3,7 +3,16 @@ from decimal import Decimal, InvalidOperation, ROUND_UP
 
 from sqlalchemy import func, select, update
 
-from database import PlategaPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
+from database import (
+    BotSetting,
+    BotUser,
+    PlategaPayment,
+    PurchaseLink,
+    Referral,
+    TokenPayment,
+    User,
+    utcnow,
+)
 
 
 PACKAGES = {
@@ -13,16 +22,104 @@ PACKAGES = {
     100: 100_000_000,
     500: 500_000_000,
 }
-TOKENS_PER_RUBLE = 1_000_000
+TOKENS_PER_MILLION = 1_000_000
+TOKEN_PRICE_SETTING = "token_price_per_million"
+DEFAULT_TOKEN_PRICE_PER_MILLION = Decimal("1.00")
+MIN_TOKEN_PRICE_PER_MILLION = Decimal("0.01")
+MAX_TOKEN_PRICE_PER_MILLION = Decimal("1000000.00")
 MIN_TOKEN_AMOUNT = 1_000_000
 MAX_TOKEN_AMOUNT = 1_000_000_000_000
 REFERRAL_MIN_TOPUP_TOKENS = 10_000_000
 REFERRAL_REWARD_TOKENS = 2_000_000
 
 
-def tokens_to_rubles(token_amount: int) -> Decimal:
+def normalize_token_price(value) -> Decimal:
+    try:
+        price = Decimal(str(value).strip().replace(",", "."))
+    except (InvalidOperation, AttributeError) as error:
+        raise ValueError("Цена должна быть числом") from error
+    if not price.is_finite() or not MIN_TOKEN_PRICE_PER_MILLION <= price <= MAX_TOKEN_PRICE_PER_MILLION:
+        raise ValueError("Цена должна быть от 0,01 до 1 000 000 ₽")
+    return price.quantize(Decimal("0.01"))
+
+
+def get_token_price(session) -> Decimal:
+    setting = session.get(BotSetting, TOKEN_PRICE_SETTING)
+    if setting is None:
+        return DEFAULT_TOKEN_PRICE_PER_MILLION
+    try:
+        return normalize_token_price(setting.value)
+    except ValueError:
+        return DEFAULT_TOKEN_PRICE_PER_MILLION
+
+
+def set_token_price(session, value) -> Decimal:
+    price = normalize_token_price(value)
+    setting = session.get(BotSetting, TOKEN_PRICE_SETTING)
+    if setting is None:
+        setting = BotSetting(key=TOKEN_PRICE_SETTING, value=format(price, "f"))
+        session.add(setting)
+    else:
+        setting.value = format(price, "f")
+        setting.updated_at = utcnow()
+    session.commit()
+    return price
+
+
+def tokens_to_rubles(
+    token_amount: int,
+    price_per_million: Decimal = DEFAULT_TOKEN_PRICE_PER_MILLION,
+) -> Decimal:
     """Round the price up to one kopeck so an invoice never undercharges."""
-    return (Decimal(token_amount) / TOKENS_PER_RUBLE).quantize(Decimal("0.01"), rounding=ROUND_UP)
+    price = normalize_token_price(price_per_million)
+    return (
+        Decimal(token_amount) / TOKENS_PER_MILLION * price
+    ).quantize(Decimal("0.01"), rounding=ROUND_UP)
+
+
+def upsert_bot_user(
+    session,
+    telegram_user_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None,
+):
+    profile = session.get(BotUser, telegram_user_id)
+    now = utcnow()
+    if profile is None:
+        profile = BotUser(telegram_user_id=telegram_user_id, first_seen_at=now)
+        session.add(profile)
+    profile.username = (username or "").lstrip("@")[:64] or None
+    profile.first_name = (first_name or "")[:128] or None
+    profile.last_name = (last_name or "")[:128] or None
+    profile.last_seen_at = now
+    session.commit()
+    return profile
+
+
+def backfill_bound_bot_users(session) -> int:
+    telegram_ids = session.scalars(
+        select(PurchaseLink.telegram_user_id)
+        .where(PurchaseLink.telegram_user_id.is_not(None))
+        .distinct()
+    ).all()
+    existing_ids = set(session.scalars(
+        select(BotUser.telegram_user_id)
+        .where(BotUser.telegram_user_id.in_(telegram_ids))
+    )) if telegram_ids else set()
+    now = utcnow()
+    missing_ids = [telegram_id for telegram_id in telegram_ids if telegram_id not in existing_ids]
+    session.add_all([
+        BotUser(
+            telegram_user_id=telegram_id,
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+        for telegram_id in missing_ids
+    ])
+    if missing_ids:
+        session.commit()
+    return len(missing_ids)
 
 
 def bind_purchase_link(session, token: str, telegram_user_id: int):
@@ -259,6 +356,7 @@ def credit_verified_platega_payment(session, payment_id: int, transaction: dict)
 
 def admin_statistics(session):
     users = session.scalar(select(func.count(User.id))) or 0
+    bot_users = session.scalar(select(func.count(BotUser.telegram_user_id))) or 0
     linked = session.scalar(
         select(func.count(PurchaseLink.id)).where(PurchaseLink.telegram_user_id.is_not(None))
     ) or 0
@@ -280,6 +378,7 @@ def admin_statistics(session):
     ) or 0
     return {
         "users": int(users),
+        "bot_users": int(bot_users),
         "linked": int(linked),
         "crypto_paid": int(crypto_paid),
         "crypto_rub": Decimal(crypto_rub),
@@ -289,13 +388,42 @@ def admin_statistics(session):
     }
 
 
-def admin_users(session, limit: int = 30):
+def admin_site_users(session, limit: int = 30):
     return list(session.execute(
-        select(User, PurchaseLink.telegram_user_id)
+        select(User, PurchaseLink, BotUser)
         .outerjoin(PurchaseLink, PurchaseLink.user_id == User.id)
+        .outerjoin(BotUser, BotUser.telegram_user_id == PurchaseLink.telegram_user_id)
         .order_by(User.id.desc())
         .limit(limit)
     ).all())
+
+
+def admin_site_user(session, user_id: int):
+    return session.execute(
+        select(User, PurchaseLink, BotUser)
+        .outerjoin(PurchaseLink, PurchaseLink.user_id == User.id)
+        .outerjoin(BotUser, BotUser.telegram_user_id == PurchaseLink.telegram_user_id)
+        .where(User.id == user_id)
+    ).one_or_none()
+
+
+def admin_bot_users(session, limit: int = 30):
+    return list(session.execute(
+        select(BotUser, PurchaseLink, User)
+        .outerjoin(PurchaseLink, PurchaseLink.telegram_user_id == BotUser.telegram_user_id)
+        .outerjoin(User, User.id == PurchaseLink.user_id)
+        .order_by(BotUser.last_seen_at.desc())
+        .limit(limit)
+    ).all())
+
+
+def admin_bot_user(session, telegram_user_id: int):
+    return session.execute(
+        select(BotUser, PurchaseLink, User)
+        .outerjoin(PurchaseLink, PurchaseLink.telegram_user_id == BotUser.telegram_user_id)
+        .outerjoin(User, User.id == PurchaseLink.user_id)
+        .where(BotUser.telegram_user_id == telegram_user_id)
+    ).one_or_none()
 
 
 def broadcast_recipients(session):

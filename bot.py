@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from cryptopay import CryptoPayClient, CryptoPayError, invoice_payment_url
 from database import Base, TokenPayment, User, database_from_environment
 from platega import PlategaClient, PlategaError
+from telegram_bot_api_10_3 import enable_bot_api_10_3_models
 from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
@@ -53,6 +54,7 @@ from payments import (
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger("emerald-payment-bot")
+enable_bot_api_10_3_models()
 router = Router(name="emerald-payments")
 LINK_PATTERN = re.compile(r"^buy_([A-Za-z0-9_-]{30,48})$")
 DEFAULT_ADMIN_ID = 7973988177

@@ -18,6 +18,8 @@ from payments import (
     credit_verified_platega_payment,
     credit_verified_payment,
     get_pending_platega_payments,
+    get_expired_platega_payments,
+    mark_expired_platega_payment_checked,
     get_token_price,
     set_token_price,
     tokens_to_rubles,
@@ -346,6 +348,61 @@ class PaymentTest(unittest.TestCase):
         self.assertLessEqual(lifetime_seconds, 3601)
         self.assertEqual(pending, [])
         self.assertEqual(stored.status, "expired")
+
+    def test_expired_platega_invoice_can_be_recovered_exactly_once(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            payment = create_platega_payment(
+                session,
+                link,
+                101,
+                Decimal("10.00"),
+                10_000_000,
+                "old-paid-payload",
+                {"transactionId": "old-paid-transaction", "expiresIn": "01:00:00"},
+            )
+            payment.expires_at = utcnow()
+            session.commit()
+        with self.Session() as session:
+            self.assertEqual(get_pending_platega_payments(session), [])
+            expired = get_expired_platega_payments(session)
+            self.assertEqual([item.id for item in expired], [payment.id])
+            credited, _ = credit_verified_platega_payment(session, payment.id, {
+                "id": "old-paid-transaction",
+                "payload": "old-paid-payload",
+                "status": "CONFIRMED",
+                "paymentDetails": {"amount": 10, "currency": "RUB"},
+            })
+            repeated, _ = credit_verified_platega_payment(session, payment.id, {
+                "id": "old-paid-transaction",
+                "payload": "old-paid-payload",
+                "status": "CONFIRMED",
+                "paymentDetails": {"amount": 10, "currency": "RUB"},
+            })
+            balance = session.get(User, 1).token_balance
+        self.assertEqual(credited, "credited")
+        self.assertEqual(repeated, "already")
+        self.assertEqual(balance, 15_000_000)
+
+    def test_unpaid_expired_platega_invoice_leaves_recovery_queue(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            payment = create_platega_payment(
+                session,
+                link,
+                101,
+                Decimal("10.00"),
+                10_000_000,
+                "old-unpaid-payload",
+                {"transactionId": "old-unpaid-transaction", "expiresIn": "01:00:00"},
+            )
+            payment.expires_at = utcnow()
+            session.commit()
+            get_pending_platega_payments(session)
+            self.assertTrue(mark_expired_platega_payment_checked(session, payment.id))
+            self.assertEqual(get_expired_platega_payments(session), [])
+            stored = session.get(PlategaPayment, payment.id)
+        self.assertEqual(stored.status, "expired_checked")
 
     def test_admin_statistics_include_platega(self):
         with self.Session() as session:

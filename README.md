@@ -4,7 +4,7 @@ Telegram worker for `@emeraldairobot`, built on aiogram 3. It accepts only perso
 
 Users can select a ready-made package or enter an exact token amount. The administrator can change the RUB price per 1,000,000 tokens from `/admin`; the setting is stored in the database and applies immediately to packages and custom amounts. Fractional totals are rounded up to one kopeck and shown before invoice creation.
 
-Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation. The Platega flow never asks for a receipt or an administrator approval.
+Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A successful payment is credited automatically and the user receives a Telegram confirmation. Expired Platega invoices receive one final provider-side check, so confirmed payments made while the worker was unavailable are recovered after restart. The Platega flow never asks for a receipt or an administrator approval.
 
 The user-facing method is named «СБП Платега». It creates a Platega v2 payment link without `paymentMethod`, so the hosted Platega page lets the payer choose any method enabled for the merchant instead of redirecting directly to SBP.
 
@@ -31,7 +31,7 @@ ADMIN_ID=7973988177
 
 `PLATEGA_MERCHANT_ID` and `PLATEGA_API_KEY` are sent only in the documented `X-MerchantId` and `X-Secret` request headers. Configure both or neither; a partial configuration stops startup instead of exposing a broken payment button. Keep real values in the hosting environment, never in the repository.
 
-Set the invoice lifetime to **60 minutes** in the Platega merchant settings. The public [create-payment-link API](https://docs.platega.io/%D1%81%D0%BE%D0%B7%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5-%D0%BF%D0%BB%D0%B0%D1%82%D0%B5%D0%B6%D0%BD%D0%BE%D0%B9-%D1%81%D1%81%D1%8B%D0%BB%D0%BA%D0%B8-%D0%B1%D0%B5%D0%B7-%D0%B7%D0%B0%D0%B4%D0%B0%D0%BD%D0%BD%D0%BE%D0%B3%D0%BE-%D0%BC%D0%B5%D1%82%D0%BE%D0%B4%D0%B0-33845703e0) returns `expiresIn` but does not accept a lifetime field. The worker also stops polling and marks its local payment expired after 60 minutes; it logs a warning when the provider returns a different lifetime.
+Set the invoice lifetime to **60 minutes** in the Platega merchant settings. The public [create-payment-link API](https://docs.platega.io/%D1%81%D0%BE%D0%B7%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5-%D0%BF%D0%BB%D0%B0%D1%82%D0%B5%D0%B6%D0%BD%D0%BE%D0%B9-%D1%81%D1%81%D1%8B%D0%BB%D0%BA%D0%B8-%D0%B1%D0%B5%D0%B7-%D0%B7%D0%B0%D0%B4%D0%B0%D0%BD%D0%BD%D0%BE%D0%B3%D0%BE-%D0%BC%D0%B5%D1%82%D0%BE%D0%B4%D0%B0-33845703e0) returns `expiresIn` but does not accept a lifetime field. The worker marks its local payment expired after 60 minutes, then performs a final Platega status check before removing it from the recovery queue; it logs a warning when the provider returns a different lifetime.
 
 `ADMIN_ID` is the only Telegram account allowed to open `/admin`, inspect Crypto Bot and Platega statistics and transactions, browse separate clickable website-user and Telegram-bot-user lists, change the token price, and run broadcasts. Telegram usernames and names are refreshed whenever a user interacts with the bot. If omitted, the configured default is `7973988177`.
 

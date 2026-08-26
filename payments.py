@@ -274,6 +274,28 @@ def get_pending_platega_payments(session, limit: int = 100):
     ))
 
 
+def get_expired_platega_payments(session, limit: int = 100):
+    """Return old invoices that still need one final provider-side check."""
+    return list(session.scalars(
+        select(PlategaPayment)
+        .where(PlategaPayment.status == "expired")
+        .order_by(PlategaPayment.created_at.asc())
+        .limit(limit)
+    ))
+
+
+def mark_expired_platega_payment_checked(session, payment_id: int) -> bool:
+    payment = session.execute(
+        select(PlategaPayment).where(PlategaPayment.id == payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None or payment.status != "expired":
+        return False
+    payment.status = "expired_checked"
+    payment.last_checked_at = utcnow()
+    session.commit()
+    return True
+
+
 def create_platega_payment(
     session,
     link: PurchaseLink,

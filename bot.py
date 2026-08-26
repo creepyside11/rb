@@ -40,6 +40,8 @@ from payments import (
     get_bound_link,
     get_pending_payments,
     get_pending_platega_payments,
+    get_expired_platega_payments,
+    mark_expired_platega_payment_checked,
     recent_platega_payments,
     save_pending_payment,
     set_token_price,
@@ -1130,6 +1132,16 @@ def load_pending_platega_payments(session_factory):
         return get_pending_platega_payments(session)
 
 
+def load_expired_platega_payments(session_factory):
+    with session_factory() as session:
+        return get_expired_platega_payments(session)
+
+
+def finish_expired_platega_check(session_factory, payment_id: int):
+    with session_factory() as session:
+        return mark_expired_platega_payment_checked(session, payment_id)
+
+
 def credit_automatic_platega_payment(session_factory, payment_id: int, transaction: dict):
     with session_factory() as session:
         result, payment = credit_verified_platega_payment(session, payment_id, transaction)
@@ -1178,6 +1190,61 @@ async def reconcile_pending_platega_payments(
             logger.exception("Could not notify Telegram user for Platega payment %s", payment.id)
 
 
+async def reconcile_expired_platega_payments(
+    bot: Bot,
+    session_factory,
+    platega: PlategaClient,
+) -> None:
+    """Recover confirmed invoices that expired locally while the worker was down."""
+    expired = await asyncio.to_thread(load_expired_platega_payments, session_factory)
+    for expired_payment in expired:
+        try:
+            transaction = await platega.get_transaction(expired_payment.transaction_id)
+        except PlategaError as error:
+            # Leave it in the recovery queue so a transient provider error is retried.
+            logger.warning(
+                "Platega recovery check failed for %s: %s",
+                expired_payment.transaction_id,
+                error,
+            )
+            continue
+        result, payment, balance = await asyncio.to_thread(
+            credit_automatic_platega_payment,
+            session_factory,
+            expired_payment.id,
+            transaction,
+        )
+        if result == "pending":
+            await asyncio.to_thread(
+                finish_expired_platega_check,
+                session_factory,
+                expired_payment.id,
+            )
+            continue
+        if result != "credited" or payment is None:
+            logger.warning(
+                "Platega recovery verification failed for payment_id=%s result=%s status=%s",
+                expired_payment.id,
+                result,
+                transaction.get("status"),
+            )
+            continue
+        logger.info(
+            "Recovered paid Platega payment_id=%s transaction_id=%s",
+            payment.id,
+            payment.transaction_id,
+        )
+        try:
+            await bot.send_message(
+                payment.telegram_user_id,
+                "✅ <b>Старая оплата найдена и зачислена!</b>\n"
+                f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+            )
+        except Exception:
+            logger.exception("Could not notify Telegram user for recovered Platega payment %s", payment.id)
+
+
 async def payment_reconciliation_loop(
     bot: Bot,
     session_factory,
@@ -1198,6 +1265,7 @@ async def payment_reconciliation_loop(
         if platega is not None:
             try:
                 await reconcile_pending_platega_payments(bot, session_factory, platega)
+                await reconcile_expired_platega_payments(bot, session_factory, platega)
             except SQLAlchemyError:
                 logger.exception("Automatic Platega database check failed")
             except Exception:

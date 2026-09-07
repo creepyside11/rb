@@ -36,18 +36,28 @@ from payments import (
     backfill_bound_bot_users,
     bind_purchase_link,
     broadcast_recipients,
+    create_free_token_task,
     create_platega_payment,
     credit_verified_platega_payment,
     credit_verified_payment,
+    delete_free_token_task,
     get_bound_link,
+    get_free_token_task,
     get_pending_payments,
     get_pending_platega_payments,
     get_expired_platega_payments,
+    grant_free_token_reward,
     grant_subscription_reward,
+    has_free_token_claim,
     has_subscription_reward,
+    list_active_free_token_tasks,
+    list_all_free_token_tasks,
     mark_expired_platega_payment_checked,
+    normalize_channel_username,
+    normalize_free_token_reward,
     recent_platega_payments,
     save_pending_payment,
+    set_free_token_task_active,
     set_token_price,
     get_token_price,
     tokens_to_rubles,
@@ -76,6 +86,9 @@ class AdminState(StatesGroup):
     waiting_for_broadcast = State()
     confirming_broadcast = State()
     waiting_for_token_price = State()
+    waiting_for_task_channel = State()
+    waiting_for_task_title = State()
+    waiting_for_task_reward = State()
 
 
 def format_tokens(value: int) -> str:
@@ -88,11 +101,51 @@ def format_rubles(value: Decimal) -> str:
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить токены", callback_data="show:packages", style="primary")],
-        [InlineKeyboardButton(text="💰 Проверить баланс", callback_data="show:balance", style="success")],
-        [InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL, style="primary")],
+        [
+            InlineKeyboardButton(text="💎 Купить", callback_data="show:packages", style="primary"),
+            InlineKeyboardButton(text="💰 Баланс", callback_data="show:balance", style="success"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Бесплатные токены", callback_data="show:free_tokens", style="primary"),
+            InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL, style="primary"),
+        ],
+        [InlineKeyboardButton(text="📄 Документы", callback_data="show:documents", style="primary")],
+    ])
+
+
+def documents_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 Пользовательское соглашение", url=USER_AGREEMENT_URL, style="primary")],
         [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=PRIVACY_POLICY_URL, style="primary")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")],
+    ])
+
+
+def free_tokens_keyboard(tasks) -> InlineKeyboardMarkup:
+    rows = []
+    for task in tasks:
+        rows.append([InlineKeyboardButton(
+            text=f"🎁 {task.title} · {format_tokens(task.reward_tokens)}",
+            callback_data=f"free:task:{task.id}",
+            style="primary",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def free_token_task_keyboard(task) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📢 Подписаться на @{task.channel_username}",
+            url=f"https://t.me/{task.channel_username}",
+            style="primary",
+        )],
+        [InlineKeyboardButton(
+            text="✅ Проверить подписку",
+            callback_data=f"free:check:{task.id}",
+            style="success",
+        )],
+        [InlineKeyboardButton(text="⬅️ К заданиям", callback_data="show:free_tokens", style="primary")],
     ])
 
 
@@ -124,13 +177,15 @@ async def send_subscription_gate(bot: Bot, chat_id: int) -> Message:
     )
 
 
-async def is_subscribed(bot: Bot, telegram_user_id: int) -> bool:
+async def is_subscribed(bot: Bot, telegram_user_id: int, channel_username: str | None = None) -> bool:
+    target = channel_username or SUBSCRIPTION_CHANNEL_USERNAME
     try:
-        member = await bot.get_chat_member(f"@{SUBSCRIPTION_CHANNEL_USERNAME}", telegram_user_id)
+        member = await bot.get_chat_member(f"@{target}", telegram_user_id)
     except Exception:
         logger.info(
-            "Could not check channel membership for user_id=%s",
+            "Could not check channel membership for user_id=%s channel=%s",
             telegram_user_id,
+            target,
         )
         return False
     return member.status in {"member", "administrator", "creator"}
@@ -185,9 +240,34 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats", style="primary")],
         [InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price", style="primary")],
+        [InlineKeyboardButton(text="🎁 Бесплатные токены", callback_data="admin:tasks", style="primary")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users", style="primary")],
         [InlineKeyboardButton(text="🧾 Платежи", callback_data="admin:payments", style="success")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast", style="primary")],
+    ])
+
+
+def admin_tasks_keyboard(tasks) -> InlineKeyboardMarkup:
+    rows = []
+    for task in tasks:
+        status = "✅" if task.is_active else "⏸"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} @{task.channel_username} · {format_tokens(task.reward_tokens)}",
+            callback_data=f"admin:task:{task.id}",
+            style="primary",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить задание", callback_data="admin:task:add", style="success")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_task_detail_keyboard(task) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ Выключить" if task.is_active else "▶️ Включить"
+    toggle_data = f"admin:task:toggle:{task.id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=toggle_data, style="primary")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin:task:delete:{task.id}", style="danger")],
+        [InlineKeyboardButton(text="⬅️ К списку заданий", callback_data="admin:tasks", style="primary")],
     ])
 
 
@@ -421,6 +501,126 @@ async def show_main_menu(callback: CallbackQuery, state: FSMContext, session_fac
         await send_main_menu(callback.bot, callback.message.chat.id, text)
 
 
+@router.callback_query(F.data == "show:documents")
+async def show_documents(callback: CallbackQuery):
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "📄 <b>Документы</b>\n\nОфициальные материалы Emerald AI:",
+            reply_markup=documents_keyboard(),
+        )
+
+
+@router.callback_query(F.data == "show:free_tokens")
+async def show_free_tokens(callback: CallbackQuery, session_factory):
+    await callback.answer()
+    with session_factory() as session:
+        tasks = list_active_free_token_tasks(session)
+    if callback.message:
+        if not tasks:
+            await callback.message.answer(
+                "🎁 <b>Бесплатные токены</b>\n\n"
+                "Сейчас нет активных заданий. Загляни позже!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")],
+                ]),
+            )
+            return
+        lines = ["🎁 <b>Бесплатные токены</b>\n", "Подпишись на каналы и получи токены:\n"]
+        for task in tasks:
+            lines.append(f"• <b>{html.escape(task.title)}</b> — {format_tokens(task.reward_tokens)} токенов")
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=free_tokens_keyboard(tasks),
+        )
+
+
+@router.callback_query(F.data.startswith("free:task:"))
+async def show_free_token_task(callback: CallbackQuery, session_factory):
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    with session_factory() as session:
+        task = get_free_token_task(session, task_id)
+        already_claimed = task is not None and has_free_token_claim(
+            session, task_id, callback.from_user.id
+        )
+    if task is None or not task.is_active:
+        await callback.answer("Задание недоступно", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        status_line = (
+            "✅ Награда уже получена."
+            if already_claimed
+            else f"🎁 Награда: <b>{format_tokens(task.reward_tokens)}</b> токенов"
+        )
+        await callback.message.answer(
+            f"🎁 <b>{html.escape(task.title)}</b>\n\n"
+            f"📢 Канал: <b>@{html.escape(task.channel_username)}</b>\n"
+            f"{status_line}\n\n"
+            "Подпишись на канал и нажми «Проверить подписку».",
+            reply_markup=free_token_task_keyboard(task),
+        )
+
+
+@router.callback_query(F.data.startswith("free:check:"))
+async def check_free_token_task(callback: CallbackQuery, session_factory):
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+    with session_factory() as session:
+        task = get_free_token_task(session, task_id)
+        if task is None or not task.is_active:
+            await callback.answer("Задание недоступно", show_alert=True)
+            return
+        if has_free_token_claim(session, task_id, callback.from_user.id):
+            await callback.answer("Награда уже получена", show_alert=True)
+            return
+    if not await is_subscribed(callback.bot, callback.from_user.id, task.channel_username):
+        await callback.answer(
+            f"Вы ещё не подписаны на @{task.channel_username}.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        user_id = link.user_id if link else None
+        result, balance = grant_free_token_reward(
+            session,
+            task,
+            callback.from_user.id,
+            user_id,
+        )
+    if result == "no_account":
+        await callback.message.answer(
+            "🔗 Сначала откройте покупку по персональной ссылке из кабинета Emerald AI, "
+            "и тогда мы начислим вам токены за задание.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if result == "already":
+        await callback.message.answer(
+            "✅ Награда за это задание уже получена.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    await callback.message.answer(
+        f"🎁 <b>Награда получена!</b>\n\n"
+        f"💎 Начислено: <b>{format_tokens(task.reward_tokens)}</b> токенов\n"
+        f"💰 Новый баланс: <b>{format_tokens(balance or 0)}</b>",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @router.callback_query(F.data == "check:subscription")
 async def check_subscription(callback: CallbackQuery, session_factory):
     if callback.message is None:
@@ -518,6 +718,11 @@ async def cancel_custom_amount(
     current_state = await state.get_state()
     await state.clear()
     if is_admin(message.from_user.id, admin_id) and current_state and current_state.startswith("AdminState:"):
+        if current_state.endswith("waiting_for_task_channel") or current_state.endswith("waiting_for_task_title") or current_state.endswith("waiting_for_task_reward"):
+            with session_factory() as session:
+                tasks = list_all_free_token_tasks(session)
+            await message.answer("↩️ Добавление задания отменено.", reply_markup=admin_tasks_keyboard(tasks))
+            return
         await message.answer("↩️ Действие отменено.", reply_markup=admin_keyboard())
         return
     token_price = read_token_price(session_factory)
@@ -754,7 +959,7 @@ async def choose_payment_method(
     # that Telegram users may still have open. Both values create only a Platega
     # checkout; the removed manual SBP flow cannot be reached.
     if method not in {"platega", "sbp"}:
-        await callback.answer("Неизвестный способ оплаты", show_alert=True)
+        await callback.answer("Неизвестный спос��б оплаты", show_alert=True)
         return
     await callback.answer("⏳ Создаю счёт…")
     await state.clear()
@@ -990,6 +1195,200 @@ async def admin_price_save(
     )
 
 
+@router.callback_query(F.data == "admin:tasks")
+async def admin_tasks_list(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        tasks = list_all_free_token_tasks(session)
+    await callback.answer()
+    if callback.message:
+        if not tasks:
+            await callback.message.answer(
+                "🎁 <b>Бесплатные токены</b>\n\n"
+                "Заданий пока нет. Добавьте канал, за подписку на который "
+                "бот будет начислять токены.",
+                reply_markup=admin_tasks_keyboard(tasks),
+            )
+            return
+        lines = ["🎁 <b>Бесплатные токены</b>\n"]
+        for task in tasks:
+            status = "✅ активен" if task.is_active else "⏸ выключен"
+            lines.append(
+                f"• <b>@{html.escape(task.channel_username)}</b> — "
+                f"{format_tokens(task.reward_tokens)} токенов · {status}"
+            )
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=admin_tasks_keyboard(tasks),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:task:") & ~F.data.startswith("admin:task:add") & ~F.data.startswith("admin:task:toggle:") & ~F.data.startswith("admin:task:delete:"))
+async def admin_task_detail(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    with session_factory() as session:
+        task = get_free_token_task(session, task_id)
+    if task is None:
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        status = "✅ активно" if task.is_active else "⏸ выключено"
+        await callback.message.answer(
+            f"🎁 <b>Задание</b>\n\n"
+            f"Канал: <b>@{html.escape(task.channel_username)}</b>\n"
+            f"Название: <b>{html.escape(task.title)}</b>\n"
+            f"Награда: <b>{format_tokens(task.reward_tokens)}</b> токенов\n"
+            f"Статус: <b>{status}</b>",
+            reply_markup=admin_task_detail_keyboard(task),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:task:toggle:"))
+async def admin_task_toggle(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    with session_factory() as session:
+        task = get_free_token_task(session, task_id)
+        if task is None:
+            await callback.answer("Задание не найдено", show_alert=True)
+            return
+        set_free_token_task_active(session, task_id, not task.is_active)
+    await callback.answer("Статус изменён")
+    if callback.message:
+        with session_factory() as session:
+            tasks = list_all_free_token_tasks(session)
+        await callback.message.answer(
+            "🎁 <b>Бесплатные токены</b>\n\nСтатус обновлён.",
+            reply_markup=admin_tasks_keyboard(tasks),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:task:delete:"))
+async def admin_task_delete(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    with session_factory() as session:
+        deleted = delete_free_token_task(session, task_id)
+    if not deleted:
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    await callback.answer("Задание удалено")
+    if callback.message:
+        with session_factory() as session:
+            tasks = list_all_free_token_tasks(session)
+        await callback.message.answer(
+            "🎁 <b>Бесплатные токены</b>\n\nЗадание удалено.",
+            reply_markup=admin_tasks_keyboard(tasks),
+        )
+
+
+@router.callback_query(F.data == "admin:task:add")
+async def admin_task_add_start(callback: CallbackQuery, state: FSMContext, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_for_task_channel)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "➕ <b>Новое задание</b>\n\n"
+            "Шаг 1 из 3.\n"
+            "Отправьте <b>username канала</b> (без @), например: <code>emeraldainews</code>\n\n"
+            "Бот должен иметь возможность проверить подписку пользователей на этот канал.\n"
+            "Для отмены отправьте /cancel."
+        )
+
+
+@router.message(AdminState.waiting_for_task_channel)
+async def admin_task_channel(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    try:
+        channel = normalize_channel_username(message.text or "")
+    except ValueError as error:
+        await message.answer(f"⚠️ {html.escape(str(error))}. Введите username ещё раз.")
+        return
+    await state.update_data(channel=channel)
+    await state.set_state(AdminState.waiting_for_task_title)
+    await message.answer(
+        f"Канал: <b>@{html.escape(channel)}</b>\n\n"
+        "Шаг 2 из 3.\n"
+        "Отправьте <b>название задания</b> — его увидит пользователь.\n"
+        "Например: <code>Подписка на новости</code>"
+    )
+
+
+@router.message(AdminState.waiting_for_task_title)
+async def admin_task_title(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    title = (message.text or "").strip()[:120]
+    if not title:
+        await message.answer("⚠️ Название не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(title=title)
+    await state.set_state(AdminState.waiting_for_task_reward)
+    await message.answer(
+        f"Название: <b>{html.escape(title)}</b>\n\n"
+        "Шаг 3 из 3.\n"
+        "Отправьте <b>награду в токенах</b> — целое число, например: <code>500000</code>"
+    )
+
+
+@router.message(AdminState.waiting_for_task_reward)
+async def admin_task_reward(message: Message, state: FSMContext, session_factory, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    try:
+        reward = normalize_free_token_reward(message.text or "")
+    except ValueError as error:
+        await message.answer(f"⚠️ {html.escape(str(error))}. Введите число ещё раз.")
+        return
+    data = await state.get_data()
+    channel = data.get("channel", "")
+    title = data.get("title", "")
+    try:
+        with session_factory() as session:
+            task = create_free_token_task(session, channel, title, reward)
+            tasks = list_all_free_token_tasks(session)
+    except ValueError as error:
+        await message.answer(f"⚠️ {html.escape(str(error))}.")
+        return
+    await state.clear()
+    await message.answer(
+        "✅ <b>Задание создано</b>\n\n"
+        f"Канал: <b>@{html.escape(task.channel_username)}</b>\n"
+        f"Название: <b>{html.escape(task.title)}</b>\n"
+        f"Награда: <b>{format_tokens(task.reward_tokens)}</b> токенов",
+        reply_markup=admin_tasks_keyboard(tasks),
+    )
+
+
 @router.callback_query(F.data == "admin:payments")
 async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id: int):
     if not is_admin(callback.from_user.id, admin_id):
@@ -1124,7 +1523,7 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
     if callback.message is None:
         return
     if crypto is None:
-        await callback.message.answer("⚠️ Crypto Bot сейчас недоступен. Попробуйте позже или выберите СБП Платега.")
+        await callback.message.answer("⚠️ Crypto Bot сейчас недоступен. Попробуйте позже или в��берите СБП Платега.")
         return
     try:
         invoice = await crypto.get_invoice(invoice_id)

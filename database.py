@@ -180,6 +180,35 @@ class SubscriptionReward(Base):
     rewarded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class FreeTokenTask(Base):
+    """Admin-managed channel subscription task that grants free tokens."""
+
+    __tablename__ = "telegram_free_token_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_username: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    reward_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class FreeTokenClaim(Base):
+    """One-time claim of a free-token task by a Telegram account."""
+
+    __tablename__ = "telegram_free_token_claims"
+
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_free_token_tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    reward_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg://", 1)

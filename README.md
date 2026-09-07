@@ -12,6 +12,12 @@ The user-facing method is named «СБП Платега». It creates a Platega 
 
 Before the bot shows the main menu it checks whether the user is subscribed to the official Telegram channel `@emeraldainews`. If the user is not subscribed, the bot blocks access and shows a gate screen with a deep link to the channel and a «Я подписался» button. After the user confirms the subscription, the bot credits a one-time reward of **400 000 tokens** to the bound Emerald AI account. The reward is recorded in the `telegram_subscription_rewards` table so it can never be claimed twice by the same Telegram account.
 
+## Free tokens section
+
+The main menu has a «🎁 Бесплатные токены» button that opens a list of admin-managed subscription tasks. Each task is a Telegram channel plus a token reward. The user opens the channel, comes back, and presses «Проверить подписку» — the bot verifies membership via `getChatMember` and credits the reward once per (task, Telegram account). Claims are stored in `telegram_free_token_claims`.
+
+Admins manage tasks from `/admin` → «🎁 Бесплатные токены»: add a new task (channel username, title, reward), toggle it active/inactive, or delete it. The mandatory `@emeraldainews` gate is separate and is not affected by the task list.
+
 ## Environment
 
 Set these variables on the bot hosting:

@@ -1,11 +1,14 @@
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_UP
+import re
 
 from sqlalchemy import func, select, update
 
 from database import (
     BotSetting,
     BotUser,
+    FreeTokenClaim,
+    FreeTokenTask,
     PlategaPayment,
     PurchaseLink,
     Referral,
@@ -508,6 +511,134 @@ def grant_subscription_reward(
         user_id=user.id,
         reward_tokens=reward_tokens,
         channel_username=channel_username,
+    ))
+    session.commit()
+    return "credited", user.token_balance
+
+
+FREE_TOKEN_MIN_REWARD = 1_000
+FREE_TOKEN_MAX_REWARD = 100_000_000_000
+
+
+def normalize_channel_username(value: str) -> str:
+    cleaned = (value or "").strip().lstrip("@").split()[0] if value else ""
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", cleaned):
+        raise ValueError("Username должен быть 4–32 символа: A–Z, a–z, 0–9, _")
+    return cleaned
+
+
+def normalize_free_token_reward(value) -> int:
+    try:
+        reward = int(str(value).strip().replace(" ", "").replace("_", ""))
+    except (ValueError, AttributeError) as error:
+        raise ValueError("Награда должна быть целым числом") from error
+    if reward < FREE_TOKEN_MIN_REWARD or reward > FREE_TOKEN_MAX_REWARD:
+        raise ValueError(
+            f"Награда должна быть от {FREE_TOKEN_MIN_REWARD:,} до {FREE_TOKEN_MAX_REWARD:,} токенов"
+        )
+    return reward
+
+
+def list_active_free_token_tasks(session):
+    return list(session.scalars(
+        select(FreeTokenTask)
+        .where(FreeTokenTask.is_active.is_(True))
+        .order_by(FreeTokenTask.created_at.asc())
+    ))
+
+
+def list_all_free_token_tasks(session):
+    return list(session.scalars(
+        select(FreeTokenTask).order_by(FreeTokenTask.created_at.asc())
+    ))
+
+
+def get_free_token_task(session, task_id: int):
+    return session.get(FreeTokenTask, task_id)
+
+
+def create_free_token_task(session, channel_username: str, title: str, reward_tokens: int) -> FreeTokenTask:
+    channel = normalize_channel_username(channel_username)
+    title_clean = (title or "").strip()[:120]
+    if not title_clean:
+        raise ValueError("Укажите название задания")
+    reward = normalize_free_token_reward(reward_tokens)
+    existing = session.scalar(
+        select(FreeTokenTask).where(FreeTokenTask.channel_username == channel)
+    )
+    if existing is not None:
+        raise ValueError(f"Задание для @{channel} уже существует")
+    task = FreeTokenTask(
+        channel_username=channel,
+        title=title_clean,
+        reward_tokens=reward,
+        is_active=True,
+    )
+    session.add(task)
+    session.commit()
+    return task
+
+
+def set_free_token_task_active(session, task_id: int, is_active: bool) -> bool:
+    task = session.get(FreeTokenTask, task_id)
+    if task is None:
+        return False
+    task.is_active = bool(is_active)
+    session.commit()
+    return True
+
+
+def delete_free_token_task(session, task_id: int) -> bool:
+    task = session.get(FreeTokenTask, task_id)
+    if task is None:
+        return False
+    session.delete(task)
+    session.commit()
+    return True
+
+
+def has_free_token_claim(session, task_id: int, telegram_user_id: int) -> bool:
+    return session.get(FreeTokenClaim, (task_id, telegram_user_id)) is not None
+
+
+def grant_free_token_reward(
+    session,
+    task: FreeTokenTask,
+    telegram_user_id: int,
+    user_id: int | None,
+) -> tuple[str, int | None]:
+    """Credit a free-token task reward exactly once per (task, Telegram account).
+
+    Returns ("credited", new_balance), ("already", current_balance), or
+    ("no_account", None) when the Telegram user has no bound Emerald AI account.
+    """
+    existing = session.execute(
+        select(FreeTokenClaim).where(
+            FreeTokenClaim.task_id == task.id,
+            FreeTokenClaim.telegram_user_id == telegram_user_id,
+        ).with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        if user_id is None:
+            return "already", None
+        user = session.get(User, user_id)
+        return "already", user.token_balance if user else None
+
+    if user_id is None:
+        return "no_account", None
+
+    user = session.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        return "no_account", None
+
+    user.token_balance += task.reward_tokens
+    session.add(FreeTokenClaim(
+        task_id=task.id,
+        telegram_user_id=telegram_user_id,
+        user_id=user.id,
+        reward_tokens=task.reward_tokens,
     ))
     session.commit()
     return "credited", user.token_balance

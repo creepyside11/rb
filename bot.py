@@ -26,6 +26,8 @@ from payments import (
     MIN_TOKEN_AMOUNT,
     PACKAGES,
     DEFAULT_TOKEN_PRICE_PER_MILLION,
+    SUBSCRIPTION_CHANNEL_USERNAME,
+    SUBSCRIPTION_REWARD_TOKENS,
     admin_bot_user,
     admin_bot_users,
     admin_site_user,
@@ -41,6 +43,8 @@ from payments import (
     get_pending_payments,
     get_pending_platega_payments,
     get_expired_platega_payments,
+    grant_subscription_reward,
+    has_subscription_reward,
     mark_expired_platega_payment_checked,
     recent_platega_payments,
     save_pending_payment,
@@ -60,6 +64,7 @@ PLATEGA_INVOICE_TTL_MINUTES = 60
 SUPPORT_URL = "https://t.me/EmeraldAiSupport"
 PRIVACY_POLICY_URL = "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-08-21-72"
 USER_AGREEMENT_URL = "https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE-08-21-55"
+CHANNEL_URL = f"https://t.me/{SUBSCRIPTION_CHANNEL_USERNAME}"
 
 
 class PurchaseState(StatesGroup):
@@ -91,8 +96,44 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def subscription_gate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📢 Подписаться на @{SUBSCRIPTION_CHANNEL_USERNAME}",
+            url=CHANNEL_URL,
+            style="primary",
+        )],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check:subscription", style="success")],
+    ])
+
+
 async def send_main_menu(bot: Bot, chat_id: int, text: str) -> Message:
     return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+async def send_subscription_gate(bot: Bot, chat_id: int) -> Message:
+    return await bot.send_message(
+        chat_id,
+        "🔒 <b>Доступ к боту закрыт</b>\n\n"
+        f"Чтобы продолжить, подпишитесь на наш Telegram-канал "
+        f"<b>@{SUBSCRIPTION_CHANNEL_USERNAME}</b>.\n\n"
+        f"🎁 В награду за подписку вы получите "
+        f"<b>{format_tokens(SUBSCRIPTION_REWARD_TOKENS)}</b> токенов бесплатно!\n\n"
+        "После подписки нажмите кнопку «Я подписался».",
+        reply_markup=subscription_gate_keyboard(),
+    )
+
+
+async def is_subscribed(bot: Bot, telegram_user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(f"@{SUBSCRIPTION_CHANNEL_USERNAME}", telegram_user_id)
+    except Exception:
+        logger.info(
+            "Could not check channel membership for user_id=%s",
+            telegram_user_id,
+        )
+        return False
+    return member.status in {"member", "administrator", "creator"}
 
 
 def balance_text(amount: int) -> str:
@@ -142,16 +183,11 @@ def payment_method_keyboard(
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats", style="primary"),
-            InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price", style="primary"),
-        ],
-        [InlineKeyboardButton(text="🌐 Пользователи сайта", callback_data="admin:site_users", style="primary")],
-        [InlineKeyboardButton(text="🤖 Пользователи бота", callback_data="admin:bot_users", style="primary")],
-        [
-            InlineKeyboardButton(text="🧾 Платежи СБП Платега", callback_data="admin:payments", style="success"),
-            InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast", style="primary"),
-        ],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats", style="primary")],
+        [InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price", style="primary")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users", style="primary")],
+        [InlineKeyboardButton(text="🧾 Платежи", callback_data="admin:payments", style="success")],
+        [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast", style="primary")],
     ])
 
 
@@ -255,7 +291,7 @@ def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить в Crypto Bot", url=payment_url, style="success")],
         [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check:{payment_id}", style="primary")],
-        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Друго�� пакет", callback_data="show:packages", style="primary")],
     ])
 
 
@@ -336,6 +372,10 @@ async def start(
         user = session.get(User, link.user_id)
         balance = user.token_balance if user else 0
         token_price = get_token_price(session)
+        already_rewarded = has_subscription_reward(session, message.from_user.id)
+    if not already_rewarded and not await is_subscribed(message.bot, message.from_user.id):
+        await send_subscription_gate(message.bot, message.chat.id)
+        return
     await send_main_menu(
         message.bot,
         message.chat.id,
@@ -379,6 +419,54 @@ async def show_main_menu(callback: CallbackQuery, state: FSMContext, session_fac
         if amount is not None:
             text = f"💚 <b>Emerald AI</b>\n\n{balance_text(amount)}\n\nВыберите действие:"
         await send_main_menu(callback.bot, callback.message.chat.id, text)
+
+
+@router.callback_query(F.data == "check:subscription")
+async def check_subscription(callback: CallbackQuery, session_factory):
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await is_subscribed(callback.bot, callback.from_user.id):
+        await callback.answer(
+            f"Вы ещё не подписаны на @{SUBSCRIPTION_CHANNEL_USERNAME}.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        user_id = link.user_id if link else None
+        result, balance = grant_subscription_reward(
+            session,
+            callback.from_user.id,
+            user_id,
+        )
+        token_price = get_token_price(session)
+    if result == "no_account":
+        await callback.message.answer(
+            "🔗 Сначала откройте покупку по персональной ссылке из кабинета Emerald AI, "
+            "и тогда мы начислим вам токены за подписку.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if result == "already":
+        await send_main_menu(
+            callback.bot,
+            callback.message.chat.id,
+            "💚 <b>Emerald AI</b>\n\n"
+            f"💎 Курс: <b>1 000 000 токенов = {format_rubles(token_price)} ₽</b>\n"
+            f"{balance_text(balance or 0)}\n\n"
+            "Выберите действие:",
+        )
+        return
+    await send_main_menu(
+        callback.bot,
+        callback.message.chat.id,
+        "🎁 <b>Спасибо за подписку!</b>\n\n"
+        f"💎 Начислено: <b>{format_tokens(SUBSCRIPTION_REWARD_TOKENS)}</b> токенов\n"
+        f"💰 Новый баланс: <b>{format_tokens(balance or 0)}</b>\n\n"
+        "Добро пожаловать в Emerald AI!",
+    )
 
 
 @router.callback_query(F.data == "show:packages")
@@ -717,20 +805,20 @@ async def admin_stats(callback: CallbackQuery, session_factory, admin_id: int):
     if callback.message:
         await callback.message.answer(
             "📊 <b>Статистика</b>\n\n"
-            f"👥 Пользователей сайта: <b>{format_tokens(stats['users'])}</b>\n"
-            f"🤖 Пользователей бота: <b>{format_tokens(stats['bot_users'])}</b>\n"
-            f"🔗 Привязано к Telegram: <b>{format_tokens(stats['linked'])}</b>\n"
-            f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> оплат · "
+            f"👥 Пользователей: <b>{format_tokens(stats['users'])}</b>\n"
+            f"🤖 В боте: <b>{format_tokens(stats['bot_users'])}</b>\n"
+            f"🔗 Привязано: <b>{format_tokens(stats['linked'])}</b>\n"
+            f"💎 Crypto Bot: <b>{stats['crypto_paid']}</b> · "
             f"<b>{format_rubles(stats['crypto_rub'])} ₽</b>\n"
-            f"🏦 СБП Платега: <b>{stats['platega_paid']}</b> оплат · "
+            f"🏦 СБП: <b>{stats['platega_paid']}</b> · "
             f"<b>{format_rubles(stats['platega_rub'])} ₽</b>\n"
-            f"⏳ Счетов СБП Платега в ожидании: <b>{stats['pending_platega']}</b>",
+            f"⏳ В ожидании: <b>{stats['pending_platega']}</b>",
             reply_markup=admin_keyboard(),
         )
 
 
-@router.callback_query(F.data.in_({"admin:site_users", "admin:users"}))
-async def admin_site_user_list(callback: CallbackQuery, session_factory, admin_id: int):
+@router.callback_query(F.data == "admin:users")
+async def admin_user_list(callback: CallbackQuery, session_factory, admin_id: int):
     if not is_admin(callback.from_user.id, admin_id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -739,7 +827,7 @@ async def admin_site_user_list(callback: CallbackQuery, session_factory, admin_i
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            "🌐 <b>Пользователи сайта</b>\n\nНажмите на пользователя, чтобы открыть карточку.",
+            "👥 <b>Пользователи</b>\n\nНажмите на пользователя, чтобы открыть карточку.",
             reply_markup=admin_site_users_keyboard(users),
         )
 
@@ -783,7 +871,7 @@ async def admin_site_user_details(
             f"Баланс: <b>{format_tokens(user.token_balance)}</b> токенов\n"
             f"Telegram ID: {f'<code>{telegram_id}</code>' if telegram_id else 'не привязан'}\n"
             f"Telegram: <b>{html.escape(telegram_name)}</b>",
-            reply_markup=admin_user_detail_keyboard("admin:site_users", username),
+            reply_markup=admin_user_detail_keyboard("admin:users", username),
         )
 
 
@@ -916,13 +1004,13 @@ async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id:
         "chargebacked": "возврат",
         "expired": "истёк",
     }
-    lines = ["🧾 <b>Последние платежи СБП Платега</b>", ""]
+    lines = ["🧾 <b>Последние платежи</b>", ""]
     for payment in payments:
         lines.append(
             f"• <code>#{payment.id}</code> · {format_rubles(Decimal(payment.rub_amount))} ₽ · "
             f"{status_names.get(payment.status, payment.status)}\n"
             f"  TG <code>{payment.telegram_user_id}</code> · {format_tokens(payment.token_amount)} токенов\n"
-            f"  Платега <code>{html.escape(payment.transaction_id)}</code>"
+            f"  ID <code>{html.escape(payment.transaction_id)}</code>"
         )
     if not payments:
         lines.append("Платежей пока нет.")
@@ -954,7 +1042,7 @@ async def admin_broadcast_preview(message: Message, state: FSMContext, admin_id:
     await state.set_state(AdminState.confirming_broadcast)
     await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id)
     await message.answer(
-        "👀 Сообщение принято. Запустить рассылку всем привязанным пользователям?",
+        "👀 Сообщение при��ято. Запустить рассылку всем привязанным пользователям?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🚀 Отправить", callback_data="broadcast:confirm", style="success"),
             InlineKeyboardButton(text="✖️ Отмена", callback_data="broadcast:cancel", style="danger"),

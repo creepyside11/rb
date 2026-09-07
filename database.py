@@ -166,6 +166,20 @@ class Referral(Base):
     rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class SubscriptionReward(Base):
+    """One-time token reward for subscribing to the official Telegram channel."""
+
+    __tablename__ = "telegram_subscription_rewards"
+
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    reward_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_username: Mapped[str] = mapped_column(String(64), nullable=False)
+    rewarded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg://", 1)

@@ -2,6 +2,7 @@ import unittest
 from decimal import Decimal
 
 from bot import (
+    CHANNEL_URL,
     PRIVACY_POLICY_URL,
     SUPPORT_URL,
     USER_AGREEMENT_URL,
@@ -12,7 +13,9 @@ from bot import (
     payment_keyboard,
     payment_method_keyboard,
     platega_payment_keyboard,
+    subscription_gate_keyboard,
 )
+from payments import SUBSCRIPTION_CHANNEL_USERNAME, SUBSCRIPTION_REWARD_TOKENS
 
 
 class BotMenuTest(unittest.TestCase):
@@ -48,7 +51,7 @@ class BotMenuTest(unittest.TestCase):
         self.assertNotIn("method:sbp", by_callback)
         self.assertEqual(by_callback["method:platega"].style, "success")
 
-    def test_admin_payment_button_uses_platega_name(self):
+    def test_admin_keyboard_is_simple_and_consolidated(self):
         buttons = [
             button
             for row in admin_keyboard().inline_keyboard
@@ -56,15 +59,35 @@ class BotMenuTest(unittest.TestCase):
         ]
         by_callback = {button.callback_data: button for button in buttons}
 
-        self.assertEqual(
-            by_callback["admin:payments"].text,
-            "🧾 Платежи СБП Платега",
-        )
-        self.assertEqual(by_callback["admin:site_users"].text, "🌐 Пользователи сайта")
-        self.assertEqual(by_callback["admin:bot_users"].text, "🤖 Пользователи бота")
+        self.assertEqual(by_callback["admin:stats"].text, "📊 Статистика")
         self.assertEqual(by_callback["admin:price"].text, "💵 Цена токенов")
+        self.assertEqual(by_callback["admin:users"].text, "👥 Пользователи")
+        self.assertEqual(by_callback["admin:payments"].text, "🧾 Платежи")
+        self.assertEqual(by_callback["admin:broadcast"].text, "📣 Рассылка")
         self.assertEqual(by_callback["admin:stats"].style, "primary")
         self.assertEqual(by_callback["admin:payments"].style, "success")
+        # Old split lists are gone.
+        self.assertNotIn("admin:site_users", by_callback)
+        self.assertNotIn("admin:bot_users", by_callback)
+
+    def test_subscription_gate_promotes_channel_and_reward(self):
+        buttons = [
+            button
+            for row in subscription_gate_keyboard().inline_keyboard
+            for button in row
+        ]
+        by_callback = {button.callback_data: button for button in buttons if button.callback_data}
+
+        self.assertEqual(
+            by_callback["check:subscription"].text,
+            "✅ Я подписался",
+        )
+        self.assertEqual(by_callback["check:subscription"].style, "success")
+        url_buttons = [button for button in buttons if button.url]
+        self.assertEqual(len(url_buttons), 1)
+        self.assertEqual(url_buttons[0].url, CHANNEL_URL)
+        self.assertIn(SUBSCRIPTION_CHANNEL_USERNAME, url_buttons[0].text)
+        self.assertEqual(SUBSCRIPTION_REWARD_TOKENS, 400_000)
 
     def test_payment_actions_use_new_button_styles(self):
         crypto_buttons = [button for row in payment_keyboard("https://example.com", 42).inline_keyboard for button in row]

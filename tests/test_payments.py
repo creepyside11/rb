@@ -4,7 +4,18 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import Base, BotUser, PlategaPayment, PurchaseLink, Referral, TokenPayment, User, utcnow
+from database import (
+    Base,
+    BattlePassClaim,
+    BattlePassLevel,
+    BotUser,
+    PlategaPayment,
+    PurchaseLink,
+    Referral,
+    TokenPayment,
+    User,
+    utcnow,
+)
 from cryptopay import CryptoPayClient, CryptoPayError
 from payments import (
     admin_statistics,
@@ -12,17 +23,26 @@ from payments import (
     admin_bot_users,
     admin_site_user,
     admin_site_users,
+    archive_battle_pass_level,
     backfill_bound_bot_users,
     bind_purchase_link,
+    claim_battle_pass_reward,
+    create_battle_pass_level,
     create_platega_payment,
     credit_verified_platega_payment,
     credit_verified_payment,
-    get_pending_platega_payments,
+    get_battle_pass_progress,
     get_expired_platega_payments,
+    get_newly_unlocked_battle_pass_levels,
+    get_pending_platega_payments,
+    list_active_battle_pass_levels,
+    list_all_battle_pass_levels,
     mark_expired_platega_payment_checked,
     get_token_price,
+    set_battle_pass_level_active,
     set_token_price,
     tokens_to_rubles,
+    update_battle_pass_level,
     upsert_bot_user,
 )
 
@@ -36,6 +56,35 @@ class PaymentTest(unittest.TestCase):
             session.add(User(id=1, name="Test", email="test@example.com", token_balance=5_000_000))
             session.add(PurchaseLink(id=1, user_id=1, token="x" * 32, is_active=True))
             session.commit()
+
+    @staticmethod
+    def add_crypto_payment(session, payment_id: int, token_amount: int, status: str = "paid"):
+        session.add(TokenPayment(
+            id=payment_id,
+            user_id=1,
+            purchase_link_id=1,
+            telegram_user_id=101,
+            invoice_id=9_000 + payment_id,
+            payload=f"battle-crypto-{payment_id}",
+            rub_amount=Decimal("1.00"),
+            token_amount=token_amount,
+            status=status,
+        ))
+
+    @staticmethod
+    def add_platega_payment(session, payment_id: int, token_amount: int, status: str = "confirmed"):
+        session.add(PlategaPayment(
+            id=payment_id,
+            user_id=1,
+            purchase_link_id=1,
+            telegram_user_id=101,
+            transaction_id=f"battle-platega-{payment_id}",
+            payload=f"battle-platega-payload-{payment_id}",
+            rub_amount=Decimal("1.00"),
+            token_amount=token_amount,
+            status=status,
+            expires_at=utcnow(),
+        ))
 
     def test_link_binds_to_only_one_telegram_account(self):
         with self.Session() as session:
@@ -429,6 +478,90 @@ class PaymentTest(unittest.TestCase):
         self.assertEqual(stats["linked"], 1)
         self.assertEqual(stats["platega_paid"], 1)
         self.assertEqual(stats["platega_rub"], Decimal("5.00"))
+
+    def test_battle_pass_progress_only_counts_confirmed_purchases(self):
+        with self.Session() as session:
+            self.add_crypto_payment(session, 101, 10_000_000, "paid")
+            self.add_crypto_payment(session, 102, 50_000_000, "pending")
+            self.add_platega_payment(session, 201, 25_000_000, "confirmed")
+            self.add_platega_payment(session, 202, 100_000_000, "canceled")
+            session.commit()
+            progress = get_battle_pass_progress(session, 1)
+
+        self.assertEqual(progress, 35_000_000)
+
+    def test_historical_purchases_unlock_matching_levels(self):
+        with self.Session() as session:
+            first = create_battle_pass_level(session, "Старт", 5_000_000, 500_000)
+            second = create_battle_pass_level(session, "Профи", 20_000_000, 1_000_000)
+            create_battle_pass_level(session, "Легенда", 50_000_000, 3_000_000)
+            self.add_crypto_payment(session, 103, 25_000_000)
+            session.commit()
+            unlocked = get_newly_unlocked_battle_pass_levels(session, 1, 25_000_000)
+
+        self.assertEqual([level.id for level in unlocked], [first.id, second.id])
+
+    def test_battle_pass_reward_is_claimed_exactly_once(self):
+        with self.Session() as session:
+            level = create_battle_pass_level(session, "Профи", 30_000_000, 2_000_000)
+            self.add_crypto_payment(session, 104, 10_000_000)
+            self.add_platega_payment(session, 204, 25_000_000)
+            session.commit()
+            first, first_balance = claim_battle_pass_reward(session, level.id, 101, 1)
+            second, second_balance = claim_battle_pass_reward(session, level.id, 202, 1)
+            claims = session.query(BattlePassClaim).all()
+
+        self.assertEqual(first, "credited")
+        self.assertEqual(second, "already")
+        self.assertEqual(first_balance, 7_000_000)
+        self.assertEqual(second_balance, 7_000_000)
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].telegram_user_id, 101)
+        self.assertEqual(claims[0].reward_tokens, 2_000_000)
+
+    def test_locked_inactive_and_archived_levels_cannot_be_claimed(self):
+        with self.Session() as session:
+            locked = create_battle_pass_level(session, "Легенда", 100_000_000, 5_000_000)
+            result, balance = claim_battle_pass_reward(session, locked.id, 101, 1)
+            self.assertEqual(result, "locked")
+            self.assertEqual(balance, 5_000_000)
+
+            self.assertTrue(set_battle_pass_level_active(session, locked.id, False))
+            result, _ = claim_battle_pass_reward(session, locked.id, 101, 1)
+            self.assertEqual(result, "inactive")
+
+            self.assertTrue(archive_battle_pass_level(session, locked.id))
+            result, _ = claim_battle_pass_reward(session, locked.id, 101, 1)
+            self.assertEqual(result, "inactive")
+            self.assertEqual(list_active_battle_pass_levels(session), [])
+            self.assertEqual(list_all_battle_pass_levels(session), [])
+            self.assertEqual(session.query(BattlePassClaim).count(), 0)
+
+    def test_battle_pass_level_editing_and_validation(self):
+        with self.Session() as session:
+            level = create_battle_pass_level(session, " Старт ", "10 000 000", "500000")
+            updated = update_battle_pass_level(
+                session,
+                level.id,
+                title="Новый уровень",
+                required_purchase_tokens="20 000 000",
+                reward_tokens="1 000 000",
+            )
+            self.assertEqual(updated.title, "Новый уровень")
+            self.assertEqual(updated.required_purchase_tokens, 20_000_000)
+            self.assertEqual(updated.reward_tokens, 1_000_000)
+            with self.assertRaises(ValueError):
+                update_battle_pass_level(session, level.id, reward_tokens="0")
+            with self.assertRaises(ValueError):
+                create_battle_pass_level(session, "", 10_000_000, 500_000)
+
+    def test_battle_pass_claim_requires_an_emerald_account(self):
+        with self.Session() as session:
+            level = create_battle_pass_level(session, "Старт", 1_000, 1_000)
+            result, balance = claim_battle_pass_reward(session, level.id, 101, None)
+
+        self.assertEqual(result, "no_account")
+        self.assertIsNone(balance)
 
 
 if __name__ == "__main__":

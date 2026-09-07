@@ -33,16 +33,23 @@ from payments import (
     admin_site_user,
     admin_site_users,
     admin_statistics,
+    archive_battle_pass_level,
     backfill_bound_bot_users,
     bind_purchase_link,
     broadcast_recipients,
+    claim_battle_pass_reward,
+    create_battle_pass_level,
     create_free_token_task,
     create_platega_payment,
     credit_verified_platega_payment,
     credit_verified_payment,
     delete_free_token_task,
+    get_battle_pass_claimed_level_ids,
+    get_battle_pass_level,
+    get_battle_pass_progress,
     get_bound_link,
     get_free_token_task,
+    get_newly_unlocked_battle_pass_levels,
     get_pending_payments,
     get_pending_platega_payments,
     get_expired_platega_payments,
@@ -50,17 +57,21 @@ from payments import (
     grant_subscription_reward,
     has_free_token_claim,
     has_subscription_reward,
+    list_active_battle_pass_levels,
     list_active_free_token_tasks,
+    list_all_battle_pass_levels,
     list_all_free_token_tasks,
     mark_expired_platega_payment_checked,
     normalize_channel_username,
     normalize_free_token_reward,
     recent_platega_payments,
     save_pending_payment,
+    set_battle_pass_level_active,
     set_free_token_task_active,
     set_token_price,
     get_token_price,
     tokens_to_rubles,
+    update_battle_pass_level,
     upsert_bot_user,
 )
 
@@ -89,6 +100,10 @@ class AdminState(StatesGroup):
     waiting_for_task_channel = State()
     waiting_for_task_title = State()
     waiting_for_task_reward = State()
+    waiting_for_battle_pass_title = State()
+    waiting_for_battle_pass_threshold = State()
+    waiting_for_battle_pass_reward = State()
+    waiting_for_battle_pass_edit_value = State()
 
 
 def format_tokens(value: int) -> str:
@@ -107,9 +122,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🎁 Бесплатные токены", callback_data="show:free_tokens", style="primary"),
-            InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL, style="primary"),
+            InlineKeyboardButton(text="🏆 Battle Pass", callback_data="show:battle_pass", style="primary"),
         ],
-        [InlineKeyboardButton(text="📄 Документы", callback_data="show:documents", style="primary")],
+        [
+            InlineKeyboardButton(text="🛟 Поддержка", url=SUPPORT_URL, style="primary"),
+            InlineKeyboardButton(text="📄 Документы", callback_data="show:documents", style="primary"),
+        ],
     ])
 
 
@@ -147,6 +165,26 @@ def free_token_task_keyboard(task) -> InlineKeyboardMarkup:
         )],
         [InlineKeyboardButton(text="⬅️ К заданиям", callback_data="show:free_tokens", style="primary")],
     ])
+
+
+def battle_pass_keyboard(levels, progress: int, claimed_level_ids: set[int]) -> InlineKeyboardMarkup:
+    rows = []
+    for level in levels:
+        if level.id not in claimed_level_ids and progress >= level.required_purchase_tokens:
+            rows.append([InlineKeyboardButton(
+                text=f"🎁 Забрать: {level.title}",
+                callback_data=f"battle_pass:claim:{level.id}",
+                style="success",
+            )])
+    rows.append([InlineKeyboardButton(text="💎 Купить токены", callback_data="show:packages", style="primary")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def battle_pass_unlocked_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🏆 Открыть Battle Pass", callback_data="show:battle_pass", style="success")
+    ]])
 
 
 def subscription_gate_keyboard() -> InlineKeyboardMarkup:
@@ -241,6 +279,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats", style="primary")],
         [InlineKeyboardButton(text="💵 Цена токенов", callback_data="admin:price", style="primary")],
         [InlineKeyboardButton(text="🎁 Бесплатные токены", callback_data="admin:tasks", style="primary")],
+        [InlineKeyboardButton(text="🏆 Battle Pass", callback_data="admin:battle_pass", style="primary")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users", style="primary")],
         [InlineKeyboardButton(text="🧾 Платежи", callback_data="admin:payments", style="success")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast", style="primary")],
@@ -268,6 +307,38 @@ def admin_task_detail_keyboard(task) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=toggle_text, callback_data=toggle_data, style="primary")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin:task:delete:{task.id}", style="danger")],
         [InlineKeyboardButton(text="⬅️ К списку заданий", callback_data="admin:tasks", style="primary")],
+    ])
+
+
+def admin_battle_pass_keyboard(levels) -> InlineKeyboardMarkup:
+    rows = []
+    for level in levels:
+        status = "✅" if level.is_active else "⏸"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} {level.title} · {format_tokens(level.required_purchase_tokens)}",
+            callback_data=f"admin:bp:view:{level.id}",
+            style="primary",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить уровень", callback_data="admin:bp:add", style="success")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin:home", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_battle_pass_detail_keyboard(level) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ Выключить" if level.is_active else "▶️ Включить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=toggle_text,
+            callback_data=f"admin:bp:toggle:{level.id}",
+            style="primary",
+        )],
+        [
+            InlineKeyboardButton(text="✏️ Название", callback_data=f"admin:bp:edit:title:{level.id}", style="primary"),
+            InlineKeyboardButton(text="🎯 Порог", callback_data=f"admin:bp:edit:threshold:{level.id}", style="primary"),
+        ],
+        [InlineKeyboardButton(text="🎁 Награда", callback_data=f"admin:bp:edit:reward:{level.id}", style="primary")],
+        [InlineKeyboardButton(text="🗄 Архивировать", callback_data=f"admin:bp:archive:{level.id}", style="danger")],
+        [InlineKeyboardButton(text="⬅️ К уровням", callback_data="admin:battle_pass", style="primary")],
     ])
 
 
@@ -417,6 +488,45 @@ def read_balance(session_factory, telegram_user_id: int):
 def read_token_price(session_factory) -> Decimal:
     with session_factory() as session:
         return get_token_price(session)
+
+
+def battle_pass_text(levels, progress: int, claimed_level_ids: set[int]) -> str:
+    lines = [
+        "🏆 <b>Battle Pass</b>",
+        "",
+        f"Куплено за всё время: <b>{format_tokens(progress)}</b> токенов",
+    ]
+    next_level = next(
+        (level for level in levels if level.required_purchase_tokens > progress),
+        None,
+    )
+    if next_level is not None:
+        target = next_level.required_purchase_tokens
+        filled = min(10, int(progress * 10 / target))
+        lines.extend([
+            f"Прогресс: <code>{'■' * filled}{'□' * (10 - filled)}</code>",
+            f"До следующего уровня: <b>{format_tokens(target - progress)}</b> токенов",
+        ])
+    elif levels:
+        lines.append("Прогресс: <code>■■■■■■■■■■</code> — все уровни открыты")
+    else:
+        lines.append("Уровни пока не добавлены. Загляните позже.")
+
+    if levels:
+        lines.extend(["", "<b>Уровни:</b>"])
+    for level in levels:
+        if level.id in claimed_level_ids:
+            status = "✅ получено"
+        elif progress >= level.required_purchase_tokens:
+            status = "🎁 можно забрать"
+        else:
+            status = "🔒 закрыто"
+        lines.append(
+            f"• <b>{html.escape(level.title)}</b> — купить "
+            f"{format_tokens(level.required_purchase_tokens)} · награда "
+            f"{format_tokens(level.reward_tokens)} · {status}"
+        )
+    return "\n".join(lines)
 
 
 @router.message(CommandStart())
@@ -621,6 +731,81 @@ async def check_free_token_task(callback: CallbackQuery, session_factory):
     )
 
 
+@router.callback_query(F.data == "show:battle_pass")
+async def show_battle_pass(callback: CallbackQuery, session_factory):
+    await callback.answer()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        if link is None:
+            user_id = None
+            levels = []
+            progress = 0
+            claimed_level_ids = set()
+        else:
+            user_id = link.user_id
+            levels = list_active_battle_pass_levels(session)
+            progress = get_battle_pass_progress(session, user_id)
+            claimed_level_ids = get_battle_pass_claimed_level_ids(session, user_id)
+    if callback.message is None:
+        return
+    if user_id is None:
+        await callback.message.answer(
+            "🔗 <b>Привяжите аккаунт Emerald AI</b>\n\n"
+            "Откройте персональную ссылку из личного кабинета. После этого "
+            "бот покажет прогресс покупок и доступные награды.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    await callback.message.answer(
+        battle_pass_text(levels, progress, claimed_level_ids),
+        reply_markup=battle_pass_keyboard(levels, progress, claimed_level_ids),
+    )
+
+
+@router.callback_query(F.data.startswith("battle_pass:claim:"))
+async def claim_battle_pass(callback: CallbackQuery, session_factory):
+    try:
+        level_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        user_id = link.user_id if link else None
+        level = get_battle_pass_level(session, level_id)
+        result, balance = claim_battle_pass_reward(
+            session,
+            level_id,
+            callback.from_user.id,
+            user_id,
+        )
+        levels = list_active_battle_pass_levels(session) if user_id is not None else []
+        progress = get_battle_pass_progress(session, user_id) if user_id is not None else 0
+        claimed_level_ids = (
+            get_battle_pass_claimed_level_ids(session, user_id)
+            if user_id is not None else set()
+        )
+    messages = {
+        "no_account": "Сначала откройте персональную ссылку из кабинета Emerald AI.",
+        "already": "Награда этого уровня уже получена.",
+        "locked": "Сначала достигните нужной суммы покупок.",
+        "inactive": "Этот уровень сейчас недоступен.",
+    }
+    if result != "credited":
+        await callback.answer(messages.get(result, "Не удалось получить награду"), show_alert=True)
+        return
+    await callback.answer("Награда начислена")
+    if callback.message:
+        reward = level.reward_tokens if level is not None else 0
+        await callback.message.answer(
+            "🎁 <b>Награда Battle Pass получена!</b>\n\n"
+            f"Начислено: <b>{format_tokens(reward)}</b> токенов\n"
+            f"Новый баланс: <b>{format_tokens(balance or 0)}</b>\n\n"
+            f"{battle_pass_text(levels, progress, claimed_level_ids)}",
+            reply_markup=battle_pass_keyboard(levels, progress, claimed_level_ids),
+        )
+
+
 @router.callback_query(F.data == "check:subscription")
 async def check_subscription(callback: CallbackQuery, session_factory):
     if callback.message is None:
@@ -722,6 +907,14 @@ async def cancel_custom_amount(
             with session_factory() as session:
                 tasks = list_all_free_token_tasks(session)
             await message.answer("↩️ Добавление задания отменено.", reply_markup=admin_tasks_keyboard(tasks))
+            return
+        if "waiting_for_battle_pass_" in current_state:
+            with session_factory() as session:
+                levels = list_all_battle_pass_levels(session)
+            await message.answer(
+                "↩️ Изменение Battle Pass отменено.",
+                reply_markup=admin_battle_pass_keyboard(levels),
+            )
             return
         await message.answer("↩️ Действие отменено.", reply_markup=admin_keyboard())
         return
@@ -1389,6 +1582,280 @@ async def admin_task_reward(message: Message, state: FSMContext, session_factory
     )
 
 
+@router.callback_query(F.data == "admin:battle_pass")
+async def admin_battle_pass_list(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with session_factory() as session:
+        levels = list_all_battle_pass_levels(session)
+    lines = ["🏆 <b>Battle Pass</b>", ""]
+    if not levels:
+        lines.append("Уровней пока нет. Добавьте первый уровень.")
+    for level in levels:
+        status = "активен" if level.is_active else "выключен"
+        lines.append(
+            f"• <b>{html.escape(level.title)}</b> — порог "
+            f"{format_tokens(level.required_purchase_tokens)}, награда "
+            f"{format_tokens(level.reward_tokens)} · {status}"
+        )
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=admin_battle_pass_keyboard(levels),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:bp:view:"))
+async def admin_battle_pass_detail(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        level_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        level = get_battle_pass_level(session, level_id)
+    if level is None or level.is_archived:
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    status = "активен" if level.is_active else "выключен"
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🏆 <b>Уровень Battle Pass</b>\n\n"
+            f"Название: <b>{html.escape(level.title)}</b>\n"
+            f"Порог покупок: <b>{format_tokens(level.required_purchase_tokens)}</b> токенов\n"
+            f"Награда: <b>{format_tokens(level.reward_tokens)}</b> токенов\n"
+            f"Статус: <b>{status}</b>",
+            reply_markup=admin_battle_pass_detail_keyboard(level),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:bp:toggle:"))
+async def admin_battle_pass_toggle(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        level_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        level = get_battle_pass_level(session, level_id)
+        changed = level is not None and not level.is_archived and set_battle_pass_level_active(
+            session, level_id, not level.is_active
+        )
+        levels = list_all_battle_pass_levels(session)
+    if not changed:
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    await callback.answer("Статус изменён")
+    if callback.message:
+        await callback.message.answer(
+            "🏆 Статус уровня обновлён.",
+            reply_markup=admin_battle_pass_keyboard(levels),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:bp:archive:"))
+async def admin_battle_pass_archive(callback: CallbackQuery, session_factory, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        level_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    with session_factory() as session:
+        archived = archive_battle_pass_level(session, level_id)
+        levels = list_all_battle_pass_levels(session)
+    if not archived:
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    await callback.answer("Уровень архивирован")
+    if callback.message:
+        await callback.message.answer(
+            "🗄 Уровень скрыт, история наград сохранена.",
+            reply_markup=admin_battle_pass_keyboard(levels),
+        )
+
+
+@router.callback_query(F.data == "admin:bp:add")
+async def admin_battle_pass_add_start(callback: CallbackQuery, state: FSMContext, admin_id: int):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminState.waiting_for_battle_pass_title)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "➕ <b>Новый уровень Battle Pass</b>\n\n"
+            "Шаг 1 из 3. Отправьте название уровня.\n"
+            "Для отмены отправьте /cancel."
+        )
+
+
+@router.message(AdminState.waiting_for_battle_pass_title)
+async def admin_battle_pass_add_title(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    title = " ".join((message.text or "").strip().split())[:80]
+    if not title:
+        await message.answer("Название не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(battle_pass_title=title)
+    await state.set_state(AdminState.waiting_for_battle_pass_threshold)
+    await message.answer(
+        f"Название: <b>{html.escape(title)}</b>\n\n"
+        "Шаг 2 из 3. Отправьте суммарное количество купленных токенов для открытия уровня."
+    )
+
+
+@router.message(AdminState.waiting_for_battle_pass_threshold)
+async def admin_battle_pass_add_threshold(message: Message, state: FSMContext, admin_id: int):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    raw_threshold = message.text or ""
+    try:
+        threshold = int(raw_threshold.replace(" ", "").replace("_", ""))
+    except (ValueError, AttributeError):
+        await message.answer("Порог должен быть целым числом. Введите ещё раз.")
+        return
+    if not 1_000 <= threshold <= 1_000_000_000_000:
+        await message.answer("Порог должен быть от 1 000 до 1 000 000 000 000 токенов.")
+        return
+    await state.update_data(battle_pass_threshold=threshold)
+    await state.set_state(AdminState.waiting_for_battle_pass_reward)
+    await message.answer(
+        f"Порог: <b>{format_tokens(threshold)}</b> токенов\n\n"
+        "Шаг 3 из 3. Отправьте размер бесплатной награды в токенах."
+    )
+
+
+@router.message(AdminState.waiting_for_battle_pass_reward)
+async def admin_battle_pass_add_reward(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    try:
+        with session_factory() as session:
+            level = create_battle_pass_level(
+                session,
+                data.get("battle_pass_title", ""),
+                data.get("battle_pass_threshold", 0),
+                message.text or "",
+            )
+            levels = list_all_battle_pass_levels(session)
+    except ValueError as error:
+        await message.answer(f"{html.escape(str(error))}. Введите награду ещё раз.")
+        return
+    await state.clear()
+    await message.answer(
+        "✅ <b>Уровень создан</b>\n\n"
+        f"{html.escape(level.title)}: купить {format_tokens(level.required_purchase_tokens)}, "
+        f"получить {format_tokens(level.reward_tokens)} токенов.",
+        reply_markup=admin_battle_pass_keyboard(levels),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:bp:edit:"))
+async def admin_battle_pass_edit_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    if not is_admin(callback.from_user.id, admin_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _admin, _bp, _edit, field, raw_level_id = callback.data.split(":")
+        level_id = int(raw_level_id)
+    except (ValueError, AttributeError):
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    if field not in {"title", "threshold", "reward"}:
+        await callback.answer("Поле не найдено", show_alert=True)
+        return
+    with session_factory() as session:
+        level = get_battle_pass_level(session, level_id)
+    if level is None or level.is_archived:
+        await callback.answer("Уровень не найден", show_alert=True)
+        return
+    labels = {
+        "title": "новое название",
+        "threshold": "новый порог покупок в токенах",
+        "reward": "новую награду в токенах",
+    }
+    await state.clear()
+    await state.update_data(battle_pass_level_id=level_id, battle_pass_edit_field=field)
+    await state.set_state(AdminState.waiting_for_battle_pass_edit_value)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            f"Отправьте {labels[field]} для уровня <b>{html.escape(level.title)}</b>.\n"
+            "Для отмены отправьте /cancel."
+        )
+
+
+@router.message(AdminState.waiting_for_battle_pass_edit_value)
+async def admin_battle_pass_edit_save(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    admin_id: int,
+):
+    if not is_admin(message.from_user.id, admin_id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    level_id = data.get("battle_pass_level_id")
+    field = data.get("battle_pass_edit_field")
+    values = {"title": None, "required_purchase_tokens": None, "reward_tokens": None}
+    key = {
+        "title": "title",
+        "threshold": "required_purchase_tokens",
+        "reward": "reward_tokens",
+    }.get(field)
+    if key is None or not isinstance(level_id, int):
+        await state.clear()
+        await message.answer("Данные редактирования устарели.", reply_markup=admin_keyboard())
+        return
+    values[key] = message.text or ""
+    try:
+        with session_factory() as session:
+            level = update_battle_pass_level(session, level_id, **values)
+            levels = list_all_battle_pass_levels(session)
+    except ValueError as error:
+        await message.answer(f"{html.escape(str(error))}. Введите значение ещё раз.")
+        return
+    await state.clear()
+    if level is None:
+        await message.answer("Уровень не найден.", reply_markup=admin_battle_pass_keyboard(levels))
+        return
+    await message.answer(
+        "✅ <b>Уровень обновлён</b>\n\n"
+        f"{html.escape(level.title)}: порог {format_tokens(level.required_purchase_tokens)}, "
+        f"награда {format_tokens(level.reward_tokens)}.",
+        reply_markup=admin_battle_pass_keyboard(levels),
+    )
+
+
 @router.callback_query(F.data == "admin:payments")
 async def admin_payment_list(callback: CallbackQuery, session_factory, admin_id: int):
     if not is_admin(callback.from_user.id, admin_id):
@@ -1546,15 +2013,31 @@ async def check_payment(callback: CallbackQuery, session_factory, crypto: Crypto
             result, payment = credit_verified_payment(session, payment_id, invoice)
             user = session.get(User, payment.user_id) if payment else None
             current_balance = user.token_balance if user else 0
+            unlocked_levels = (
+                get_newly_unlocked_battle_pass_levels(
+                    session, payment.user_id, payment.token_amount
+                )
+                if result == "credited" and payment is not None else []
+            )
     except SQLAlchemyError:
         logger.exception("Database failure while crediting payment %s", payment_id)
         await callback.message.answer("⚠️ База временно недоступна. Автопроверка повторит начисление.")
         return
     if result == "credited":
+        unlock_notice = ""
+        reply_markup = None
+        if unlocked_levels:
+            unlock_notice = (
+                f"\n🏆 Открыто новых уровней Battle Pass: <b>{len(unlocked_levels)}</b>. "
+                "Награду можно забрать вручную."
+            )
+            reply_markup = battle_pass_unlocked_keyboard()
         await callback.message.answer(
             f"✅ <b>Оплата подтверждена!</b>\n"
             f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
             f"💰 Новый баланс: <b>{format_tokens(current_balance)}</b>"
+            f"{unlock_notice}",
+            reply_markup=reply_markup,
         )
     elif result == "already":
         await callback.message.answer(
@@ -1577,7 +2060,13 @@ def credit_automatic_payment(session_factory, payment_id: int, invoice: dict):
         result, payment = credit_verified_payment(session, payment_id, invoice)
         user = session.get(User, payment.user_id) if payment else None
         balance = user.token_balance if user else 0
-        return result, payment, balance
+        unlocked_levels = (
+            get_newly_unlocked_battle_pass_levels(
+                session, payment.user_id, payment.token_amount
+            )
+            if result == "credited" and payment is not None else []
+        )
+        return result, payment, balance, unlocked_levels
 
 
 async def reconcile_pending_payments(bot: Bot, session_factory, crypto: CryptoPayClient) -> None:
@@ -1593,7 +2082,7 @@ async def reconcile_pending_payments(bot: Bot, session_factory, crypto: CryptoPa
         invoice = invoice_by_id.get(pending_payment.invoice_id)
         if invoice is None or invoice.get("status") != "paid":
             continue
-        result, payment, balance = await asyncio.to_thread(
+        result, payment, balance, unlocked_levels = await asyncio.to_thread(
             credit_automatic_payment,
             session_factory,
             pending_payment.id,
@@ -1603,11 +2092,17 @@ async def reconcile_pending_payments(bot: Bot, session_factory, crypto: CryptoPa
             continue
         logger.info("Automatically credited payment_id=%s invoice_id=%s", payment.id, payment.invoice_id)
         try:
+            unlock_notice = (
+                f"\n🏆 Открыто новых уровней Battle Pass: <b>{len(unlocked_levels)}</b>."
+                if unlocked_levels else ""
+            )
             await bot.send_message(
                 payment.telegram_user_id,
                 "✅ <b>Оплата подтверждена автоматически!</b>\n"
                 f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
-                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>"
+                f"{unlock_notice}",
+                reply_markup=battle_pass_unlocked_keyboard() if unlocked_levels else None,
             )
         except Exception:
             # The balance is already committed; a Telegram delivery failure must not roll it back.
@@ -1634,7 +2129,13 @@ def credit_automatic_platega_payment(session_factory, payment_id: int, transacti
         result, payment = credit_verified_platega_payment(session, payment_id, transaction)
         user = session.get(User, payment.user_id) if payment else None
         balance = user.token_balance if user else 0
-        return result, payment, balance
+        unlocked_levels = (
+            get_newly_unlocked_battle_pass_levels(
+                session, payment.user_id, payment.token_amount
+            )
+            if result == "credited" and payment is not None else []
+        )
+        return result, payment, balance, unlocked_levels
 
 
 async def reconcile_pending_platega_payments(
@@ -1653,7 +2154,7 @@ async def reconcile_pending_platega_payments(
                 error,
             )
             continue
-        result, payment, balance = await asyncio.to_thread(
+        result, payment, balance, unlocked_levels = await asyncio.to_thread(
             credit_automatic_platega_payment,
             session_factory,
             pending_payment.id,
@@ -1667,11 +2168,17 @@ async def reconcile_pending_platega_payments(
             payment.transaction_id,
         )
         try:
+            unlock_notice = (
+                f"\n🏆 Открыто новых уровней Battle Pass: <b>{len(unlocked_levels)}</b>."
+                if unlocked_levels else ""
+            )
             await bot.send_message(
                 payment.telegram_user_id,
                 "✅ <b>Оплата подтверждена автоматически!</b>\n"
                 f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
-                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>"
+                f"{unlock_notice}",
+                reply_markup=battle_pass_unlocked_keyboard() if unlocked_levels else None,
             )
         except Exception:
             logger.exception("Could not notify Telegram user for Platega payment %s", payment.id)
@@ -1695,7 +2202,7 @@ async def reconcile_expired_platega_payments(
                 error,
             )
             continue
-        result, payment, balance = await asyncio.to_thread(
+        result, payment, balance, unlocked_levels = await asyncio.to_thread(
             credit_automatic_platega_payment,
             session_factory,
             expired_payment.id,
@@ -1722,11 +2229,17 @@ async def reconcile_expired_platega_payments(
             payment.transaction_id,
         )
         try:
+            unlock_notice = (
+                f"\n🏆 Открыто новых уровней Battle Pass: <b>{len(unlocked_levels)}</b>."
+                if unlocked_levels else ""
+            )
             await bot.send_message(
                 payment.telegram_user_id,
                 "✅ <b>Старая оплата найдена и зачислена!</b>\n"
                 f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
-                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>",
+                f"💰 Новый баланс: <b>{format_tokens(balance)}</b>"
+                f"{unlock_notice}",
+                reply_markup=battle_pass_unlocked_keyboard() if unlocked_levels else None,
             )
         except Exception:
             logger.exception("Could not notify Telegram user for recovered Platega payment %s", payment.id)

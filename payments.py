@@ -5,6 +5,8 @@ import re
 from sqlalchemy import func, select, update
 
 from database import (
+    BattlePassClaim,
+    BattlePassLevel,
     BotSetting,
     BotUser,
     FreeTokenClaim,
@@ -639,6 +641,194 @@ def grant_free_token_reward(
         telegram_user_id=telegram_user_id,
         user_id=user.id,
         reward_tokens=task.reward_tokens,
+    ))
+    session.commit()
+    return "credited", user.token_balance
+
+
+BATTLE_PASS_MIN_TOKENS = 1_000
+BATTLE_PASS_MAX_TOKENS = 1_000_000_000_000
+
+
+def normalize_battle_pass_title(value: str) -> str:
+    title = " ".join((value or "").strip().split())[:80]
+    if not title:
+        raise ValueError("Укажите название уровня")
+    return title
+
+
+def normalize_battle_pass_tokens(value, label: str) -> int:
+    try:
+        amount = int(str(value).strip().replace(" ", "").replace("_", ""))
+    except (ValueError, AttributeError) as error:
+        raise ValueError(f"{label} должно быть целым числом") from error
+    if not BATTLE_PASS_MIN_TOKENS <= amount <= BATTLE_PASS_MAX_TOKENS:
+        raise ValueError(
+            f"{label} должно быть от {BATTLE_PASS_MIN_TOKENS:,} до "
+            f"{BATTLE_PASS_MAX_TOKENS:,} токенов"
+        )
+    return amount
+
+
+def list_active_battle_pass_levels(session):
+    return list(session.scalars(
+        select(BattlePassLevel)
+        .where(
+            BattlePassLevel.is_active.is_(True),
+            BattlePassLevel.is_archived.is_(False),
+        )
+        .order_by(BattlePassLevel.required_purchase_tokens.asc(), BattlePassLevel.id.asc())
+    ))
+
+
+def list_all_battle_pass_levels(session):
+    return list(session.scalars(
+        select(BattlePassLevel)
+        .where(BattlePassLevel.is_archived.is_(False))
+        .order_by(BattlePassLevel.required_purchase_tokens.asc(), BattlePassLevel.id.asc())
+    ))
+
+
+def get_battle_pass_level(session, level_id: int):
+    return session.get(BattlePassLevel, level_id)
+
+
+def create_battle_pass_level(
+    session,
+    title: str,
+    required_purchase_tokens: int,
+    reward_tokens: int,
+) -> BattlePassLevel:
+    level = BattlePassLevel(
+        title=normalize_battle_pass_title(title),
+        required_purchase_tokens=normalize_battle_pass_tokens(
+            required_purchase_tokens, "Порог покупки"
+        ),
+        reward_tokens=normalize_battle_pass_tokens(reward_tokens, "Награда"),
+        is_active=True,
+        is_archived=False,
+    )
+    session.add(level)
+    session.commit()
+    return level
+
+
+def update_battle_pass_level(
+    session,
+    level_id: int,
+    *,
+    title: str | None = None,
+    required_purchase_tokens: int | None = None,
+    reward_tokens: int | None = None,
+) -> BattlePassLevel | None:
+    level = session.get(BattlePassLevel, level_id)
+    if level is None or level.is_archived:
+        return None
+    if title is not None:
+        level.title = normalize_battle_pass_title(title)
+    if required_purchase_tokens is not None:
+        level.required_purchase_tokens = normalize_battle_pass_tokens(
+            required_purchase_tokens, "Порог покупки"
+        )
+    if reward_tokens is not None:
+        level.reward_tokens = normalize_battle_pass_tokens(reward_tokens, "Награда")
+    session.commit()
+    return level
+
+
+def set_battle_pass_level_active(session, level_id: int, is_active: bool) -> bool:
+    level = session.get(BattlePassLevel, level_id)
+    if level is None or level.is_archived:
+        return False
+    level.is_active = bool(is_active)
+    session.commit()
+    return True
+
+
+def archive_battle_pass_level(session, level_id: int) -> bool:
+    level = session.get(BattlePassLevel, level_id)
+    if level is None or level.is_archived:
+        return False
+    level.is_active = False
+    level.is_archived = True
+    session.commit()
+    return True
+
+
+def get_battle_pass_progress(session, user_id: int) -> int:
+    crypto_tokens = session.scalar(
+        select(func.coalesce(func.sum(TokenPayment.token_amount), 0)).where(
+            TokenPayment.user_id == user_id,
+            TokenPayment.status == "paid",
+        )
+    ) or 0
+    platega_tokens = session.scalar(
+        select(func.coalesce(func.sum(PlategaPayment.token_amount), 0)).where(
+            PlategaPayment.user_id == user_id,
+            PlategaPayment.status == "confirmed",
+        )
+    ) or 0
+    return int(crypto_tokens) + int(platega_tokens)
+
+
+def get_battle_pass_claimed_level_ids(session, user_id: int) -> set[int]:
+    return set(session.scalars(
+        select(BattlePassClaim.level_id).where(BattlePassClaim.user_id == user_id)
+    ))
+
+
+def get_newly_unlocked_battle_pass_levels(
+    session,
+    user_id: int,
+    latest_purchase_tokens: int,
+):
+    progress = get_battle_pass_progress(session, user_id)
+    previous_progress = max(0, progress - int(latest_purchase_tokens))
+    claimed_ids = get_battle_pass_claimed_level_ids(session, user_id)
+    return [
+        level
+        for level in list_active_battle_pass_levels(session)
+        if previous_progress < level.required_purchase_tokens <= progress
+        and level.id not in claimed_ids
+    ]
+
+
+def claim_battle_pass_reward(
+    session,
+    level_id: int,
+    telegram_user_id: int,
+    user_id: int | None,
+) -> tuple[str, int | None]:
+    if user_id is None:
+        return "no_account", None
+
+    user = session.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        return "no_account", None
+
+    level = session.execute(
+        select(BattlePassLevel)
+        .where(BattlePassLevel.id == level_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if level is None or level.is_archived or not level.is_active:
+        return "inactive", user.token_balance
+
+    existing = session.get(BattlePassClaim, (level_id, user_id))
+    if existing is not None:
+        return "already", user.token_balance
+
+    if get_battle_pass_progress(session, user_id) < level.required_purchase_tokens:
+        return "locked", user.token_balance
+
+    user.token_balance += level.reward_tokens
+    session.add(BattlePassClaim(
+        level_id=level.id,
+        user_id=user.id,
+        telegram_user_id=telegram_user_id,
+        reward_tokens=level.reward_tokens,
     ))
     session.commit()
     return "credited", user.token_balance

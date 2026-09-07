@@ -7,10 +7,14 @@ from bot import (
     PRIVACY_POLICY_URL,
     SUPPORT_URL,
     USER_AGREEMENT_URL,
+    admin_battle_pass_detail_keyboard,
+    admin_battle_pass_keyboard,
     admin_keyboard,
     admin_task_detail_keyboard,
     admin_tasks_keyboard,
     balance_text,
+    battle_pass_keyboard,
+    battle_pass_text,
     documents_keyboard,
     free_token_task_keyboard,
     free_tokens_keyboard,
@@ -44,6 +48,67 @@ class BotMenuTest(unittest.TestCase):
         # Legal links moved out of the main menu.
         self.assertNotIn("📄 Пользовательское соглашение", by_text)
         self.assertNotIn("🔒 Политика конфиденциальности", by_text)
+
+    def test_main_menu_has_three_compact_rows_and_battle_pass(self):
+        keyboard = main_menu_keyboard()
+        self.assertEqual([len(row) for row in keyboard.inline_keyboard], [2, 2, 2])
+        by_callback = {
+            button.callback_data: button
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertEqual(by_callback["show:battle_pass"].text, "🏆 Battle Pass")
+
+    def test_battle_pass_keyboard_only_claims_unlocked_levels(self):
+        levels = [
+            SimpleNamespace(id=1, title="Старт", required_purchase_tokens=10_000_000, reward_tokens=500_000),
+            SimpleNamespace(id=2, title="Профи", required_purchase_tokens=50_000_000, reward_tokens=2_000_000),
+            SimpleNamespace(id=3, title="Легенда", required_purchase_tokens=100_000_000, reward_tokens=5_000_000),
+        ]
+        keyboard = battle_pass_keyboard(levels, 60_000_000, {1})
+        by_callback = {
+            button.callback_data: button
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+
+        self.assertNotIn("battle_pass:claim:1", by_callback)
+        self.assertEqual(by_callback["battle_pass:claim:2"].text, "🎁 Забрать: Профи")
+        self.assertNotIn("battle_pass:claim:3", by_callback)
+        self.assertIn("show:packages", by_callback)
+        text = battle_pass_text(levels, 60_000_000, {1})
+        self.assertIn("■■■■■■□□□□", text)
+        self.assertIn("40 000 000", text)
+        self.assertIn("можно забрать", text)
+
+    def test_admin_battle_pass_keyboards_support_full_management(self):
+        levels = [
+            SimpleNamespace(id=7, title="Старт", required_purchase_tokens=10_000_000, is_active=True),
+            SimpleNamespace(id=8, title="Профи", required_purchase_tokens=50_000_000, is_active=False),
+        ]
+        list_buttons = [
+            button
+            for row in admin_battle_pass_keyboard(levels).inline_keyboard
+            for button in row
+        ]
+        list_by_callback = {button.callback_data: button for button in list_buttons if button.callback_data}
+        self.assertEqual(list_by_callback["admin:bp:view:7"].text, "✅ Старт · 10 000 000")
+        self.assertEqual(list_by_callback["admin:bp:view:8"].text, "⏸ Профи · 50 000 000")
+        self.assertIn("admin:bp:add", list_by_callback)
+
+        detail_buttons = [
+            button
+            for row in admin_battle_pass_detail_keyboard(levels[0]).inline_keyboard
+            for button in row
+        ]
+        detail_callbacks = {button.callback_data for button in detail_buttons if button.callback_data}
+        self.assertIn("admin:bp:toggle:7", detail_callbacks)
+        self.assertIn("admin:bp:edit:title:7", detail_callbacks)
+        self.assertIn("admin:bp:edit:threshold:7", detail_callbacks)
+        self.assertIn("admin:bp:edit:reward:7", detail_callbacks)
+        self.assertIn("admin:bp:archive:7", detail_callbacks)
 
     def test_documents_keyboard_links_to_legal_pages(self):
         buttons = [button for row in documents_keyboard().inline_keyboard for button in row]
@@ -108,6 +173,7 @@ class BotMenuTest(unittest.TestCase):
         self.assertEqual(by_callback["admin:stats"].text, "📊 Статистика")
         self.assertEqual(by_callback["admin:price"].text, "💵 Цена токенов")
         self.assertEqual(by_callback["admin:tasks"].text, "🎁 Бесплатные токены")
+        self.assertEqual(by_callback["admin:battle_pass"].text, "🏆 Battle Pass")
         self.assertEqual(by_callback["admin:users"].text, "👥 Пользователи")
         self.assertEqual(by_callback["admin:payments"].text, "🧾 Платежи")
         self.assertEqual(by_callback["admin:broadcast"].text, "📣 Рассылка")

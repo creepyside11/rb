@@ -209,6 +209,36 @@ class FreeTokenClaim(Base):
     claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class BattlePassLevel(Base):
+    """Permanent purchase milestone configured by a Telegram administrator."""
+
+    __tablename__ = "telegram_battle_pass_levels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    required_purchase_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    reward_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class BattlePassClaim(Base):
+    """One-time Battle Pass reward tied to an Emerald AI account."""
+
+    __tablename__ = "telegram_battle_pass_claims"
+
+    level_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_battle_pass_levels.id", ondelete="RESTRICT"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    reward_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg://", 1)

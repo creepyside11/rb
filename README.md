@@ -8,6 +8,10 @@ Pending invoices are reconciled with Crypto Pay and Platega every 5 seconds. A s
 
 The user-facing method is named «СБП Платега». It creates a Platega v2 payment link without `paymentMethod`, so the hosted Platega page lets the payer choose any method enabled for the merchant instead of redirecting directly to SBP.
 
+## Channel subscription gate
+
+Before the bot shows the main menu it checks whether the user is subscribed to the official Telegram channel `@emeraldainews`. If the user is not subscribed, the bot blocks access and shows a gate screen with a deep link to the channel and a «Я подписался» button. After the user confirms the subscription, the bot credits a one-time reward of **400 000 tokens** to the bound Emerald AI account. The reward is recorded in the `telegram_subscription_rewards` table so it can never be claimed twice by the same Telegram account.
+
 ## Environment
 
 Set these variables on the bot hosting:

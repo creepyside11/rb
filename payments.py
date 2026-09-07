@@ -9,6 +9,7 @@ from database import (
     PlategaPayment,
     PurchaseLink,
     Referral,
+    SubscriptionReward,
     TokenPayment,
     User,
     utcnow,
@@ -31,6 +32,8 @@ MIN_TOKEN_AMOUNT = 1_000_000
 MAX_TOKEN_AMOUNT = 1_000_000_000_000
 REFERRAL_MIN_TOPUP_TOKENS = 10_000_000
 REFERRAL_REWARD_TOKENS = 2_000_000
+SUBSCRIPTION_REWARD_TOKENS = 400_000
+SUBSCRIPTION_CHANNEL_USERNAME = "emeraldainews"
 
 
 def normalize_token_price(value) -> Decimal:
@@ -460,3 +463,51 @@ def recent_platega_payments(session, limit: int = 20):
     return list(session.scalars(
         select(PlategaPayment).order_by(PlategaPayment.created_at.desc()).limit(limit)
     ))
+
+
+def has_subscription_reward(session, telegram_user_id: int) -> bool:
+    return session.get(SubscriptionReward, telegram_user_id) is not None
+
+
+def grant_subscription_reward(
+    session,
+    telegram_user_id: int,
+    user_id: int | None,
+    channel_username: str = SUBSCRIPTION_CHANNEL_USERNAME,
+    reward_tokens: int = SUBSCRIPTION_REWARD_TOKENS,
+) -> tuple[str, int | None]:
+    """Credit the one-time subscription reward exactly once per Telegram account.
+
+    Returns ("credited", new_balance) on success, ("already", current_balance) if
+    the reward was already granted, or ("no_account", None) when the Telegram
+    user has no bound Emerald AI account to credit.
+    """
+    existing = session.execute(
+        select(SubscriptionReward).where(
+            SubscriptionReward.telegram_user_id == telegram_user_id
+        ).with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        if user_id is None:
+            return "already", None
+        user = session.get(User, user_id)
+        return "already", user.token_balance if user else None
+
+    if user_id is None:
+        return "no_account", None
+
+    user = session.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        return "no_account", None
+
+    user.token_balance += reward_tokens
+    session.add(SubscriptionReward(
+        telegram_user_id=telegram_user_id,
+        user_id=user.id,
+        reward_tokens=reward_tokens,
+        channel_username=channel_username,
+    ))
+    session.commit()
+    return "credited", user.token_balance

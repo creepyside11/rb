@@ -3,6 +3,11 @@ from decimal import Decimal
 
 import aiohttp
 
+from profile_feature import enable_legacy_bot_entrypoint
+
+
+enable_legacy_bot_entrypoint()
+
 
 class CryptoPayError(RuntimeError):
     def __init__(self, code: str, *, status: int | None = None):

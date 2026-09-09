@@ -1,0 +1,23 @@
+name: Bot tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m py_compile bot.py bot_core.py cryptopay.py database.py payments.py platega.py profile_feature.py run_bot.py
+      - name: Run tests
+        run: python -m unittest discover -s tests -v

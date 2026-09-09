@@ -6,12 +6,13 @@ from profile_feature import install
 from runtime_main import run as _run
 
 
-# Register profile handlers only after bot_core finished importing and all
-# router/database/menu objects already exist.
+# Keep the original exported helper for backwards-compatible unit tests and
+# imports, but patch bot_core itself: all real handlers resolve their globals
+# from bot_core and therefore use the menu with the Profile button.
+_public_main_menu_keyboard = main_menu_keyboard
 install(_core)
-
-# Re-export the patched menu for callers importing `bot` as a module.
-main_menu_keyboard = _core.main_menu_keyboard
+main_menu_keyboard = _public_main_menu_keyboard
+runtime_main_menu_keyboard = _core.main_menu_keyboard
 
 
 async def main():

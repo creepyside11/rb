@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import secrets
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from aiogram import F
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import generate_password_hash
 
 
@@ -17,6 +19,7 @@ RESET_CALLBACK = "profile:reset_password"
 RESET_CONFIRM_CALLBACK = "profile:reset_password:confirm"
 HIDE_PASSWORD_CALLBACK = "profile:hide_password"
 _installed = False
+_reset_locks: dict[int, asyncio.Lock] = {}
 
 
 def add_profile_button(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
@@ -40,7 +43,7 @@ def profile_text(profile: dict[str, Any]) -> str:
         f"Email / логин: <code>{html.escape(str(profile['email']))}</code>\n"
         f"ID: <code>{int(profile['id'])}</code>\n"
         f"Баланс: <b>{format(int(profile['token_balance']), ',').replace(',', ' ')}</b> токенов\n\n"
-        "🔐 Пароль хранится только как хэш и не может быть показан. "
+        "🔐 Текущий пароль хранится только как хэш и не может быть показан. "
         "Если вы его забыли, нажмите «Сбросить пароль»."
     )
 
@@ -124,6 +127,8 @@ def _load_profile(bot_module, session_factory, telegram_user_id: int):
 
 
 def _reset_password(bot_module, session_factory, telegram_user_id: int):
+    # Werkzeug is also used by the Emerald website, so the generated hash is
+    # directly compatible with User.check_password(). Plaintext is never stored.
     password = secrets.token_urlsafe(14)
     password_hash = generate_password_hash(password)
     now = datetime.now(timezone.utc)
@@ -175,10 +180,26 @@ def install(bot_module) -> None:
     @bot_module.router.callback_query(F.data == PROFILE_CALLBACK)
     async def show_profile(callback: CallbackQuery, session_factory):
         if not _private_message(callback):
-            await callback.answer("Профиль доступен только в личном чате с ботом.", show_alert=True)
+            await callback.answer(
+                "Профиль доступен только в личном чате с ботом.",
+                show_alert=True,
+            )
             return
         await callback.answer()
-        profile = _load_profile(bot_module, session_factory, callback.from_user.id)
+        try:
+            profile = await asyncio.to_thread(
+                _load_profile,
+                bot_module,
+                session_factory,
+                callback.from_user.id,
+            )
+        except SQLAlchemyError:
+            bot_module.logger.exception("Could not load profile")
+            await callback.message.answer(
+                "⚠️ Не удалось загрузить профиль. Попробуйте ещё раз чуть позже.",
+                reply_markup=bot_module.main_menu_keyboard(),
+            )
+            return
         if profile is None:
             await callback.message.answer(
                 "🔗 Сначала привяжите аккаунт Emerald AI через персональную ссылку из кабинета.",
@@ -193,7 +214,10 @@ def install(bot_module) -> None:
     @bot_module.router.callback_query(F.data == RESET_CALLBACK)
     async def confirm_password_reset(callback: CallbackQuery):
         if not _private_message(callback):
-            await callback.answer("Сброс пароля доступен только в личном чате с ботом.", show_alert=True)
+            await callback.answer(
+                "Сброс пароля доступен только в личном чате с ботом.",
+                show_alert=True,
+            )
             return
         await callback.answer()
         await callback.message.answer(
@@ -206,20 +230,51 @@ def install(bot_module) -> None:
     @bot_module.router.callback_query(F.data == RESET_CONFIRM_CALLBACK)
     async def reset_password(callback: CallbackQuery, session_factory):
         if not _private_message(callback):
-            await callback.answer("Сброс пароля доступен только в личном чате с ботом.", show_alert=True)
+            await callback.answer(
+                "Сброс пароля доступен только в личном чате с ботом.",
+                show_alert=True,
+            )
             return
+
+        telegram_user_id = callback.from_user.id
+        lock = _reset_locks.setdefault(telegram_user_id, asyncio.Lock())
+        if lock.locked():
+            await callback.answer("Сброс пароля уже выполняется.", show_alert=True)
+            return
+
         await callback.answer()
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        result = _reset_password(bot_module, session_factory, callback.from_user.id)
+        async with lock:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                result = await asyncio.to_thread(
+                    _reset_password,
+                    bot_module,
+                    session_factory,
+                    telegram_user_id,
+                )
+            except SQLAlchemyError:
+                bot_module.logger.exception(
+                    "Could not reset password for telegram_user_id=%s",
+                    telegram_user_id,
+                )
+                await callback.message.answer(
+                    "⚠️ Не удалось сбросить пароль. Старый пароль не изменён. Попробуйте позже.",
+                    reply_markup=bot_module.main_menu_keyboard(),
+                )
+                return
+            finally:
+                _reset_locks.pop(telegram_user_id, None)
+
         if result is None:
             await callback.message.answer(
                 "🔗 Привязанный аккаунт не найден.",
                 reply_markup=bot_module.main_menu_keyboard(),
             )
             return
+
         password = result["password"]
         await callback.message.answer(
             "✅ <b>Пароль успешно сброшен</b>\n\n"

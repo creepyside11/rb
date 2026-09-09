@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import html
 import secrets
-import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,9 +16,7 @@ PROFILE_CALLBACK = "show:profile"
 RESET_CALLBACK = "profile:reset_password"
 RESET_CONFIRM_CALLBACK = "profile:reset_password:confirm"
 HIDE_PASSWORD_CALLBACK = "profile:hide_password"
-_installed_modules: set[int] = set()
-_legacy_bootstrap_enabled = False
-_original_asyncio_run = asyncio.run
+_installed = False
 
 
 def add_profile_button(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
@@ -164,10 +160,10 @@ def _private_message(callback: CallbackQuery) -> bool:
 
 
 def install(bot_module) -> None:
-    module_id = id(bot_module)
-    if module_id in _installed_modules:
+    global _installed
+    if _installed:
         return
-    _installed_modules.add(module_id)
+    _installed = True
 
     original_main_menu_keyboard = bot_module.main_menu_keyboard
 
@@ -253,25 +249,3 @@ def install(bot_module) -> None:
                     )
                 ]]),
             )
-
-
-def enable_legacy_bot_entrypoint() -> None:
-    """Install the profile feature even when hosting still runs `python bot.py`."""
-    global _legacy_bootstrap_enabled
-    if _legacy_bootstrap_enabled:
-        return
-    _legacy_bootstrap_enabled = True
-
-    def run_with_profile(main, *, debug=None, loop_factory=None):
-        main_module = sys.modules.get("__main__")
-        if (
-            main_module is not None
-            and hasattr(main_module, "router")
-            and hasattr(main_module, "main_menu_keyboard")
-            and hasattr(main_module, "get_bound_link")
-            and hasattr(main_module, "User")
-        ):
-            install(main_module)
-        return _original_asyncio_run(main, debug=debug, loop_factory=loop_factory)
-
-    asyncio.run = run_with_profile

@@ -446,11 +446,14 @@ def payment_keyboard(payment_url: str, payment_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def platega_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def platega_payment_keyboard(payment_url: str, payment_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="🏦 Оплатить через СБП Платега", url=payment_url, style="success")],
-        [InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages", style="primary")],
-    ])
+    ]
+    if payment_id is not None:
+        rows.append([InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_platega:{payment_id}", style="primary")])
+    rows.append([InlineKeyboardButton(text="⬅️ Другой пакет", callback_data="show:packages", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def crypto_error_message(error: CryptoPayError) -> str:
@@ -1038,8 +1041,8 @@ async def issue_platega_invoice(
         f"💎 Будет начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
         f"⏱ Срок действия: <b>{PLATEGA_INVOICE_TTL_MINUTES} минут</b>\n\n"
         "На странице оплаты выберите удобный способ. После успешной оплаты "
-        "токены зачислятся автоматически — отправлять чек и нажимать кнопку проверки не нужно.",
-        reply_markup=platega_payment_keyboard(payment_url),
+        "токены зачислятся автоматически — или нажмите кнопку «Проверить оплату».",
+        reply_markup=platega_payment_keyboard(payment_url, payment.id),
     )
 
 
@@ -1971,6 +1974,78 @@ async def admin_broadcast_send(
             f"Не доставлено: <b>{failed}</b>",
             reply_markup=admin_keyboard(),
         )
+
+
+@router.callback_query(F.data.startswith("check_platega:"))
+async def check_platega_payment(callback: CallbackQuery, session_factory, platega: PlategaClient | None):
+    try:
+        payment_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("❌ Некорректный счёт", show_alert=True)
+        return
+    with session_factory() as session:
+        payment = session.get(PlategaPayment, payment_id)
+        if payment is None or payment.telegram_user_id != callback.from_user.id:
+            await callback.answer("❌ Счёт не найден", show_alert=True)
+            return
+        transaction_id = payment.transaction_id
+    await callback.answer("🔍 Проверяю оплату…")
+    if callback.message is None:
+        return
+    if platega is None:
+        await callback.message.answer("⚠️ Platega сейчас недоступна. Попробуйте позже.")
+        return
+    try:
+        transaction = await platega.get_transaction(transaction_id)
+    except PlategaError as error:
+        logger.warning("Platega status check failed for %s: %s", transaction_id, error)
+        await callback.message.answer(
+            f"⚠️ Platega пока не ответила. Автопроверка продолжает работать.\n"
+            f"Код: <code>{html.escape(error.code)}</code>"
+        )
+        return
+    except Exception:
+        logger.exception("Unexpected Platega check failure for transaction %s", transaction_id)
+        await callback.message.answer("⚠️ Не удалось проверить сейчас. Автопроверка повторит попытку через 5 секунд.")
+        return
+    try:
+        result, payment, balance, unlocked_levels = await asyncio.to_thread(
+            credit_automatic_platega_payment,
+            session_factory,
+            payment_id,
+            transaction,
+        )
+    except SQLAlchemyError:
+        logger.exception("Database failure while crediting Platega payment %s", payment_id)
+        await callback.message.answer("⚠️ База временно недоступна. Автопроверка повторит начисление.")
+        return
+    if result == "credited":
+        unlock_notice = ""
+        reply_markup = None
+        if unlocked_levels:
+            unlock_notice = (
+                f"\n🏆 Открыто новых уровней Battle Pass: <b>{len(unlocked_levels)}</b>. "
+                "Награду можно забрать вручную."
+            )
+            reply_markup = battle_pass_unlocked_keyboard()
+        await callback.message.answer(
+            f"✅ <b>Оплата подтверждена!</b>\n"
+            f"💎 Начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+            f"💰 Новый баланс: <b>{format_tokens(balance)}</b>"
+            f"{unlock_notice}",
+            reply_markup=reply_markup,
+        )
+    elif result == "already":
+        await callback.message.answer(
+            f"✅ Этот счёт уже зачислен.\n💰 Баланс: <b>{format_tokens(balance)}</b>"
+        )
+    elif result == "pending":
+        await callback.message.answer("⏳ Оплата пока не найдена. Оплатите счёт и проверьте ещё раз.")
+    elif result in {"canceled", "chargebacked"}:
+        await callback.message.answer("❌ Платёж отменён платёжной системой.")
+    else:
+        logger.warning("Platega verification mismatch for payment %s", payment_id)
+        await callback.message.answer("⚠️ Данные счёта не совпали. Баланс не изменён.")
 
 
 @router.callback_query(F.data.startswith("check:"))

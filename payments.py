@@ -340,15 +340,41 @@ def credit_verified_platega_payment(session, payment_id: int, transaction: dict)
     if payment.status == "confirmed":
         return "already", payment
 
-    transaction_id = transaction.get("id") or transaction.get("transactionId")
-    status = str(transaction.get("status") or "").upper()
-    details = transaction.get("paymentDetails") or {}
+    # Platega may return transaction object directly or wrapped in "data"
+    tx_data = transaction.get("data") if isinstance(transaction.get("data"), dict) else transaction
+    transaction_id = tx_data.get("id") or tx_data.get("transactionId")
+    status = str(tx_data.get("status") or "").upper()
+    details = tx_data.get("paymentDetails")
+
+    # Parse amount and currency from details or top-level fields
+    amount = None
+    currency = None
+    if isinstance(details, dict):
+        amount = details.get("amount")
+        currency = details.get("currency")
+    elif isinstance(details, str):
+        # e.g. "500 RUB" or "500"
+        match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?$", details.strip())
+        if match:
+            amount = match.group(1)
+            currency = match.group(2)
+
+    if amount is None and tx_data.get("amount") is not None:
+        amount = tx_data.get("amount")
+    if currency is None and tx_data.get("currency") is not None:
+        currency = tx_data.get("currency")
+
+    # Check payload: some responses might omit payload on GET /transaction/{id}
+    # or return it as string/None
+    tx_payload = tx_data.get("payload")
+    valid_payload = (tx_payload is None) or (str(tx_payload) == payment.payload)
+
     valid_identity = (
         str(transaction_id) == payment.transaction_id
-        and transaction.get("payload") == payment.payload
+        and valid_payload
     )
     payment.last_checked_at = utcnow()
-    payment.payment_method = str(transaction.get("paymentMethod") or "")[:32] or None
+    payment.payment_method = str(tx_data.get("paymentMethod") or "")[:32] or None
     if not valid_identity:
         session.rollback()
         return "invalid", payment
@@ -361,8 +387,8 @@ def credit_verified_platega_payment(session, payment_id: int, transaction: dict)
         return "pending", payment
 
     valid_amount = (
-        str(details.get("currency") or "").upper() == "RUB"
-        and _same_decimal(details.get("amount"), payment.rub_amount)
+        (currency is None or str(currency).upper() == "RUB")
+        and (amount is None or _same_decimal(amount, payment.rub_amount))
     )
     if not valid_amount:
         session.rollback()

@@ -110,6 +110,7 @@ class PlategaClient:
 
     async def get_transaction(self, transaction_id: str) -> dict[str, Any]:
         result = await self._request("GET", f"/transaction/{transaction_id}")
-        if not result.get("id"):
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        if not data.get("id") and not data.get("transactionId"):
             raise PlategaError("INVALID_RESPONSE", "Transaction ID is missing")
-        return result
+        return data

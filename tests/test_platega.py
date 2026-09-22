@@ -51,6 +51,33 @@ class PlategaClientTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.exception.code, "INVALID_RESPONSE")
 
+    async def test_get_transaction_unwraps_data_and_handles_ids(self):
+        # Top-level id
+        self.client._request = AsyncMock(return_value={
+            "id": "tx-123",
+            "status": "CONFIRMED",
+            "paymentDetails": {"amount": 10, "currency": "RUB"},
+        })
+        res1 = await self.client.get_transaction("tx-123")
+        self.assertEqual(res1["id"], "tx-123")
+        self.assertEqual(res1["status"], "CONFIRMED")
+
+        # Nested in "data"
+        self.client._request = AsyncMock(return_value={
+            "data": {
+                "transactionId": "tx-456",
+                "status": "PENDING",
+            }
+        })
+        res2 = await self.client.get_transaction("tx-456")
+        self.assertEqual(res2["transactionId"], "tx-456")
+
+        # Missing id raises error
+        self.client._request = AsyncMock(return_value={"status": "CONFIRMED"})
+        with self.assertRaises(PlategaError) as ctx:
+            await self.client.get_transaction("missing-id")
+        self.assertEqual(ctx.exception.code, "INVALID_RESPONSE")
+
 
 if __name__ == "__main__":
     unittest.main()

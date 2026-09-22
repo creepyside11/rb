@@ -238,11 +238,13 @@ class BotMenuTest(unittest.TestCase):
 
     def test_payment_actions_use_new_button_styles(self):
         crypto_buttons = [button for row in payment_keyboard("https://example.com", 42).inline_keyboard for button in row]
-        platega_buttons = [button for row in platega_payment_keyboard("https://example.com").inline_keyboard for button in row]
+        platega_buttons = [button for row in platega_payment_keyboard("https://example.com", 99).inline_keyboard for button in row]
 
         self.assertEqual(crypto_buttons[0].style, "success")
         self.assertEqual(crypto_buttons[1].style, "primary")
         self.assertEqual(platega_buttons[0].style, "success")
+        self.assertEqual(platega_buttons[1].style, "primary")
+        self.assertEqual(platega_buttons[1].callback_data, "check_platega:99")
 
     def test_package_menu_uses_configured_price(self):
         buttons = [

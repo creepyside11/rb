@@ -349,6 +349,48 @@ class PaymentTest(unittest.TestCase):
         self.assertEqual(referral.payment_source, "platega")
         self.assertEqual(referrer_balance, 7_000_000)
 
+    def test_platega_payment_accepts_flexible_response_formats(self):
+        with self.Session() as session:
+            link = session.get(PurchaseLink, 1)
+            # Format 1: data wrapper and string paymentDetails "50 RUB"
+            payment1 = create_platega_payment(
+                session, link, 101, Decimal("50.00"), 50_000_000, "payload-flex-1",
+                {"transactionId": "tx-flex-1"}
+            )
+            credited1, _ = credit_verified_platega_payment(session, payment1.id, {
+                "data": {
+                    "id": "tx-flex-1",
+                    "status": "CONFIRMED",
+                    "paymentDetails": "50 RUB",
+                }
+            })
+            self.assertEqual(credited1, "credited")
+
+            # Format 2: top-level amount and currency without paymentDetails
+            payment2 = create_platega_payment(
+                session, link, 101, Decimal("100.00"), 100_000_000, "payload-flex-2",
+                {"transactionId": "tx-flex-2"}
+            )
+            credited2, _ = credit_verified_platega_payment(session, payment2.id, {
+                "id": "tx-flex-2",
+                "status": "CONFIRMED",
+                "amount": 100,
+                "currency": "RUB",
+            })
+            self.assertEqual(credited2, "credited")
+
+            # Format 3: transactionId instead of id, status lowercase or uppercase
+            payment3 = create_platega_payment(
+                session, link, 101, Decimal("15.00"), 15_000_000, "payload-flex-3",
+                {"transactionId": "tx-flex-3"}
+            )
+            credited3, _ = credit_verified_platega_payment(session, payment3.id, {
+                "transactionId": "tx-flex-3",
+                "status": "confirmed",
+                "paymentDetails": {"amount": 15.0, "currency": "rub"},
+            })
+            self.assertEqual(credited3, "credited")
+
     def test_unconfirmed_platega_payment_never_credits_balance(self):
         with self.Session() as session:
             link = session.get(PurchaseLink, 1)

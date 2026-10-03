@@ -172,8 +172,8 @@ def install(bot_module) -> None:
 
     original_main_menu_keyboard = bot_module.main_menu_keyboard
 
-    def main_menu_keyboard_with_profile() -> InlineKeyboardMarkup:
-        return add_profile_button(original_main_menu_keyboard())
+    def main_menu_keyboard_with_profile(is_seller: bool = False) -> InlineKeyboardMarkup:
+        return add_profile_button(original_main_menu_keyboard(is_seller=is_seller))
 
     bot_module.main_menu_keyboard = main_menu_keyboard_with_profile
 

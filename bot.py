@@ -10,9 +10,9 @@ from runtime_patches import apply as _apply_runtime_patches
 # Keep the original exported helper for backwards-compatible unit tests and
 # imports, but patch bot_core itself: all real handlers resolve their globals
 # from bot_core and therefore use the menu with the Profile button.
-_public_main_menu_keyboard = main_menu_keyboard
 install(_core)
 _apply_runtime_patches(_core)
+_public_main_menu_keyboard = _core.main_menu_keyboard
 main_menu_keyboard = _public_main_menu_keyboard
 runtime_main_menu_keyboard = _core.main_menu_keyboard
 

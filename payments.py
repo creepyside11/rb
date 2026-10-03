@@ -74,6 +74,61 @@ def set_token_price(session, value) -> Decimal:
     return price
 
 
+def seller_discount_percent(token_amount: int) -> int:
+    """Calculate wholesale discount for seller balance:
+    - 500M: 5%
+    - 1 000M (1B): 10%
+    - 2 000M (2B): 20%
+    - 3 000M (3B): 30%
+    - 4 000M (4B): 40%
+    - 5 000M+ (5B+): 50% max
+    """
+    if token_amount < 500_000_000:
+        return 0
+    if token_amount < 1_000_000_000:
+        return 5
+    if token_amount < 2_000_000_000:
+        return 10
+    if token_amount < 3_000_000_000:
+        return 20
+    if token_amount < 4_000_000_000:
+        return 30
+    if token_amount < 5_000_000_000:
+        return 40
+    return 50
+
+
+def seller_tokens_to_rubles(
+    token_amount: int,
+    price_per_million: Decimal = DEFAULT_TOKEN_PRICE_PER_MILLION,
+) -> tuple[Decimal, int, Decimal]:
+    """Returns (final_rub_amount, discount_percent, saved_rub_amount)."""
+    base_rub = tokens_to_rubles(token_amount, price_per_million)
+    discount = seller_discount_percent(token_amount)
+    if discount == 0:
+        return base_rub, 0, Decimal("0.00")
+    multiplier = Decimal(100 - discount) / Decimal(100)
+    final_rub = (base_rub * multiplier).quantize(Decimal("0.01"), rounding=ROUND_UP)
+    saved_rub = (base_rub - final_rub).quantize(Decimal("0.01"))
+    return final_rub, discount, saved_rub
+
+
+def is_seller_user(session, user_id: int) -> bool:
+    from database import SellerProfile
+    profile = session.get(SellerProfile, user_id)
+    return profile is not None and profile.is_active
+
+
+def get_user_and_seller_balance(session, user_id: int) -> tuple[int, int | None]:
+    from database import SellerProfile, User
+    user = session.get(User, user_id)
+    if user is None:
+        return 0, None
+    profile = session.get(SellerProfile, user_id)
+    seller_bal = profile.seller_token_balance if (profile and profile.is_active) else None
+    return int(user.token_balance), seller_bal
+
+
 def tokens_to_rubles(
     token_amount: int,
     price_per_million: Decimal = DEFAULT_TOKEN_PRICE_PER_MILLION,
@@ -170,6 +225,7 @@ def save_pending_payment(
     token_amount: int,
     payload: str,
     invoice: dict,
+    target_balance: str = "user",
 ):
     payment = TokenPayment(
         user_id=link.user_id,
@@ -179,6 +235,7 @@ def save_pending_payment(
         payload=payload,
         rub_amount=Decimal(rub_amount),
         token_amount=token_amount,
+        target_balance=target_balance,
         status="pending",
     )
     session.add(payment)
@@ -254,7 +311,19 @@ def credit_verified_payment(session, payment_id: int, invoice: dict):
     user = session.execute(select(User).where(User.id == payment.user_id).with_for_update()).scalar_one_or_none()
     if user is None:
         return "invalid", payment
-    user.token_balance += payment.token_amount
+
+    if getattr(payment, "target_balance", "user") == "seller":
+        from database import SellerProfile
+        profile = session.execute(
+            select(SellerProfile).where(SellerProfile.user_id == user.id).with_for_update()
+        ).scalar_one_or_none()
+        if profile is not None:
+            profile.seller_token_balance = (profile.seller_token_balance or 0) + payment.token_amount
+        else:
+            user.token_balance += payment.token_amount
+    else:
+        user.token_balance += payment.token_amount
+
     payment.status = "paid"
     payment.paid_asset = str(invoice.get("paid_asset") or "")[:16] or None
     payment.paid_amount = str(invoice.get("paid_amount") or "")[:64] or None
@@ -313,6 +382,7 @@ def create_platega_payment(
     payload: str,
     transaction: dict,
     ttl_minutes: int = 60,
+    target_balance: str = "user",
 ):
     payment = PlategaPayment(
         user_id=link.user_id,
@@ -322,6 +392,7 @@ def create_platega_payment(
         payload=payload,
         rub_amount=Decimal(rub_amount),
         token_amount=token_amount,
+        target_balance=target_balance,
         status="pending",
         provider_expires_in=str(transaction.get("expiresIn") or "")[:24] or None,
         expires_at=utcnow() + timedelta(minutes=ttl_minutes),
@@ -400,11 +471,158 @@ def credit_verified_platega_payment(session, payment_id: int, transaction: dict)
     if user is None:
         session.rollback()
         return "invalid", payment
-    user.token_balance += payment.token_amount
+
+    if getattr(payment, "target_balance", "user") == "seller":
+        from database import SellerProfile
+        profile = session.execute(
+            select(SellerProfile).where(SellerProfile.user_id == user.id).with_for_update()
+        ).scalar_one_or_none()
+        if profile is not None:
+            profile.seller_token_balance = (profile.seller_token_balance or 0) + payment.token_amount
+        else:
+            user.token_balance += payment.token_amount
+    else:
+        user.token_balance += payment.token_amount
+
     payment.status = "confirmed"
     payment.paid_at = utcnow()
     apply_first_topup_referral_reward(
         session, user.id, payment.token_amount, "platega", payment.id
+    )
+    session.commit()
+    return "credited", payment
+
+
+def get_pending_xrocket_payments(session, limit: int = 100):
+    from database import XRocketPayment
+    return list(session.scalars(
+        select(XRocketPayment)
+        .where(XRocketPayment.status == "pending")
+        .order_by(XRocketPayment.created_at.asc())
+        .limit(limit)
+    ))
+
+
+def save_pending_xrocket_payment(
+    session,
+    link: PurchaseLink,
+    telegram_user_id: int,
+    rub_amount: Decimal,
+    token_amount: int,
+    payload: str,
+    invoice_id: str,
+    payment_url: str | None = None,
+    target_balance: str = "user",
+):
+    from database import XRocketPayment
+    payment = XRocketPayment(
+        user_id=link.user_id,
+        purchase_link_id=link.id,
+        telegram_user_id=telegram_user_id,
+        invoice_id=str(invoice_id),
+        payload=payload,
+        rub_amount=Decimal(rub_amount),
+        token_amount=token_amount,
+        target_balance=target_balance,
+        status="pending",
+        payment_url=payment_url,
+    )
+    session.add(payment)
+    session.commit()
+    return payment
+
+
+def credit_verified_xrocket_payment(session, payment_id: int, invoice: dict):
+    from database import SellerProfile, User, XRocketPayment
+    payment = session.execute(
+        select(XRocketPayment).where(XRocketPayment.id == payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None:
+        return "invalid", None
+    if payment.status in {"paid", "completed"}:
+        return "already", payment
+
+    # xRocket status can be "paid" / "completed"
+    raw_status = str(invoice.get("status") or "").lower()
+    if raw_status not in {"paid", "completed"}:
+        return "unpaid", payment
+
+    user = session.execute(
+        select(User).where(User.id == payment.user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        return "invalid", payment
+
+    if getattr(payment, "target_balance", "user") == "seller":
+        profile = session.execute(
+            select(SellerProfile).where(SellerProfile.user_id == user.id).with_for_update()
+        ).scalar_one_or_none()
+        if profile is not None:
+            profile.seller_token_balance = (profile.seller_token_balance or 0) + payment.token_amount
+        else:
+            user.token_balance += payment.token_amount
+    else:
+        user.token_balance += payment.token_amount
+
+    payment.status = "paid"
+    payment.paid_asset = str(invoice.get("currency") or invoice.get("asset") or "")[:16] or None
+    payment.paid_amount = str(invoice.get("amount") or "")[:64] or None
+    payment.paid_at = utcnow()
+    apply_first_topup_referral_reward(
+        session, user.id, payment.token_amount, "xrocket", payment.id
+    )
+    session.commit()
+    return "credited", payment
+
+
+def credit_stars_payment(
+    session,
+    link: PurchaseLink,
+    telegram_user_id: int,
+    telegram_charge_id: str,
+    payload: str,
+    stars_amount: int,
+    token_amount: int,
+    target_balance: str = "user",
+):
+    from database import SellerProfile, StarsPayment, User
+    existing = session.execute(
+        select(StarsPayment).where(StarsPayment.telegram_charge_id == telegram_charge_id)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return "already", existing
+
+    user = session.execute(
+        select(User).where(User.id == link.user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        return "invalid", None
+
+    if target_balance == "seller":
+        profile = session.execute(
+            select(SellerProfile).where(SellerProfile.user_id == user.id).with_for_update()
+        ).scalar_one_or_none()
+        if profile is not None:
+            profile.seller_token_balance = (profile.seller_token_balance or 0) + token_amount
+        else:
+            user.token_balance += token_amount
+    else:
+        user.token_balance += token_amount
+
+    payment = StarsPayment(
+        user_id=link.user_id,
+        purchase_link_id=link.id,
+        telegram_user_id=telegram_user_id,
+        telegram_charge_id=telegram_charge_id,
+        payload=payload,
+        stars_amount=stars_amount,
+        token_amount=token_amount,
+        target_balance=target_balance,
+        status="paid",
+    )
+    session.add(payment)
+    apply_first_topup_referral_reward(
+        session, user.id, token_amount, "stars", payment.id
     )
     session.commit()
     return "credited", payment

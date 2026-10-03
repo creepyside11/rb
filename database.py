@@ -24,6 +24,17 @@ class User(Base):
     token_balance: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SellerProfile(Base):
+    __tablename__ = "seller_profiles"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    seller_token_balance: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ApiKey(Base):
     """Shared API-key table mapping used to create the limits table safely."""
 
@@ -102,6 +113,7 @@ class TokenPayment(Base):
     payload: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
     rub_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_balance: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
     paid_asset: Mapped[str | None] = mapped_column(String(16))
     paid_amount: Mapped[str | None] = mapped_column(String(64))
@@ -124,6 +136,7 @@ class PlategaPayment(Base):
     payload: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
     rub_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_balance: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
     payment_method: Mapped[str | None] = mapped_column(String(32))
     provider_expires_in: Mapped[str | None] = mapped_column(String(24))
@@ -131,6 +144,50 @@ class PlategaPayment(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class XRocketPayment(Base):
+    """Automatically reconciled xRocket payment-link transaction."""
+
+    __tablename__ = "xrocket_token_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    purchase_link_id: Mapped[int] = mapped_column(
+        ForeignKey("purchase_links.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    invoice_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    payload: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
+    rub_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_balance: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    payment_url: Mapped[str | None] = mapped_column(Text)
+    paid_asset: Mapped[str | None] = mapped_column(String(16))
+    paid_amount: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StarsPayment(Base):
+    """Telegram Stars (XTR) payment transaction."""
+
+    __tablename__ = "stars_token_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    purchase_link_id: Mapped[int] = mapped_column(
+        ForeignKey("purchase_links.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    telegram_charge_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    payload: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
+    stars_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    token_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_balance: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="paid", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class ReferralCode(Base):

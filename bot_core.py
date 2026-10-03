@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from cryptopay import CryptoPayClient, CryptoPayError, invoice_payment_url
 from database import Base, TokenPayment, User, database_from_environment
 from platega import PlategaClient, PlategaError
+from xrocket import XRocketClient, XRocketError
 from payments import (
     MAX_TOKEN_AMOUNT,
     MIN_TOKEN_AMOUNT,
@@ -43,6 +44,8 @@ from payments import (
     create_platega_payment,
     credit_verified_platega_payment,
     credit_verified_payment,
+    credit_verified_xrocket_payment,
+    credit_stars_payment,
     delete_free_token_task,
     get_battle_pass_claimed_level_ids,
     get_battle_pass_level,
@@ -52,11 +55,14 @@ from payments import (
     get_newly_unlocked_battle_pass_levels,
     get_pending_payments,
     get_pending_platega_payments,
+    get_pending_xrocket_payments,
     get_expired_platega_payments,
     grant_free_token_reward,
     grant_subscription_reward,
     has_free_token_claim,
     has_subscription_reward,
+    is_seller_user,
+    get_user_and_seller_balance,
     list_active_battle_pass_levels,
     list_active_free_token_tasks,
     list_all_battle_pass_levels,
@@ -66,6 +72,9 @@ from payments import (
     normalize_free_token_reward,
     recent_platega_payments,
     save_pending_payment,
+    save_pending_xrocket_payment,
+    seller_discount_percent,
+    seller_tokens_to_rubles,
     set_battle_pass_level_active,
     set_free_token_task_active,
     set_token_price,
@@ -90,7 +99,9 @@ CHANNEL_URL = f"https://t.me/{SUBSCRIPTION_CHANNEL_USERNAME}"
 
 class PurchaseState(StatesGroup):
     waiting_for_token_amount = State()
+    waiting_for_seller_token_amount = State()
     choosing_payment_method = State()
+    choosing_seller_payment_method = State()
 
 
 class AdminState(StatesGroup):
@@ -114,12 +125,21 @@ def format_rubles(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01")), "f").rstrip("0").rstrip(".")
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💎 Купить", callback_data="show:packages", style="primary"),
-            InlineKeyboardButton(text="💰 Баланс", callback_data="show:balance", style="success"),
-        ],
+def main_menu_keyboard(is_seller: bool = False) -> InlineKeyboardMarkup:
+    top_row = [
+        InlineKeyboardButton(text="💎 Купить", callback_data="show:packages", style="primary"),
+        InlineKeyboardButton(text="💰 Баланс", callback_data="show:balance", style="success"),
+    ]
+    rows = [top_row]
+    if is_seller:
+        rows.append([
+            InlineKeyboardButton(
+                text="💼 Пополнить баланс продавца",
+                callback_data="show:seller_packages",
+                style="success",
+            )
+        ])
+    rows.extend([
         [
             InlineKeyboardButton(text="🎁 Бесплатные токены", callback_data="show:free_tokens", style="primary"),
             InlineKeyboardButton(text="🏆 Battle Pass", callback_data="show:battle_pass", style="primary"),
@@ -129,6 +149,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📄 Документы", callback_data="show:documents", style="primary"),
         ],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def documents_keyboard() -> InlineKeyboardMarkup:
@@ -198,8 +219,8 @@ def subscription_gate_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def send_main_menu(bot: Bot, chat_id: int, text: str) -> Message:
-    return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+async def send_main_menu(bot: Bot, chat_id: int, text: str, is_seller: bool = False) -> Message:
+    return await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard(is_seller=is_seller))
 
 
 async def send_subscription_gate(bot: Bot, chat_id: int) -> Message:
@@ -229,8 +250,39 @@ async def is_subscribed(bot: Bot, telegram_user_id: int, channel_username: str |
     return member.status in {"member", "administrator", "creator"}
 
 
-def balance_text(amount: int) -> str:
-    return f"💰 Ваш баланс: <b>{format_tokens(amount)}</b> токенов"
+def balance_text(amount: int, seller_amount: int | None = None) -> str:
+    lines = [f"💰 Ваш личный баланс: <b>{format_tokens(amount)}</b> токенов"]
+    if seller_amount is not None:
+        lines.append(f"💼 Баланс продавца: <b>{format_tokens(seller_amount)}</b> токенов")
+    return "\n".join(lines)
+
+
+SELLER_PACKAGES = {
+    500: 500_000_000,
+    1000: 1_000_000_000,
+    2000: 2_000_000_000,
+    3000: 3_000_000_000,
+    5000: 5_000_000_000,
+}
+
+
+def seller_package_keyboard(
+    price_per_million: Decimal = DEFAULT_TOKEN_PRICE_PER_MILLION,
+) -> InlineKeyboardMarkup:
+    from payments import seller_tokens_to_rubles
+    rows = []
+    for pkg_id, tokens in SELLER_PACKAGES.items():
+        rub_amount, discount, _ = seller_tokens_to_rubles(tokens, price_per_million)
+        disc_text = f" (-{discount}%)" if discount > 0 else ""
+        rows.append([InlineKeyboardButton(
+            text=f"💼 {format_tokens(tokens)} токенов · {format_rubles(rub_amount)} ₽{disc_text}",
+            callback_data=f"seller_buy:{pkg_id}",
+            style="primary",
+        )])
+    rows.append([InlineKeyboardButton(text="✍️ Своё количество для продавца", callback_data="seller_buy:custom", style="primary")])
+    rows.append([InlineKeyboardButton(text="💰 Проверить балансы", callback_data="show:balance", style="success")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="show:menu", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def package_keyboard(
@@ -256,21 +308,38 @@ def package_keyboard(
 def payment_method_keyboard(
     crypto_available: bool = True,
     platega_available: bool = True,
+    xrocket_available: bool = True,
+    stars_available: bool = True,
+    target_balance: str = "user",
 ) -> InlineKeyboardMarkup:
     rows = []
+    pfx = f"seller_method" if target_balance == "seller" else "method"
+    back_target = "show:seller_packages" if target_balance == "seller" else "show:packages"
     if crypto_available:
         rows.append([InlineKeyboardButton(
             text="💎 Crypto Bot · автоматически",
-            callback_data="method:crypto",
+            callback_data=f"{pfx}:crypto",
+            style="success",
+        )])
+    if xrocket_available:
+        rows.append([InlineKeyboardButton(
+            text="🚀 xRocket · автоматически",
+            callback_data=f"{pfx}:xrocket",
+            style="success",
+        )])
+    if stars_available:
+        rows.append([InlineKeyboardButton(
+            text="⭐️ Telegram Stars (1⭐ = 1₽)",
+            callback_data=f"{pfx}:stars",
             style="success",
         )])
     if platega_available:
         rows.append([InlineKeyboardButton(
             text="🏦 СБП Платега · автоматически",
-            callback_data="method:platega",
+            callback_data=f"{pfx}:platega",
             style="success",
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data="show:packages", style="primary")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к пакетам", callback_data=back_target, style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -484,8 +553,9 @@ def platega_error_message(error: PlategaError) -> str:
 def read_balance(session_factory, telegram_user_id: int):
     with session_factory() as session:
         link = get_bound_link(session, telegram_user_id)
-        user = session.get(User, link.user_id) if link else None
-        return user.token_balance if user else None
+        if not link:
+            return None, None
+        return get_user_and_seller_balance(session, link.user_id)
 
 
 def read_token_price(session_factory) -> Decimal:
@@ -563,7 +633,8 @@ async def start(
             )
             return
         user = session.get(User, link.user_id)
-        balance = user.token_balance if user else 0
+        balance, seller_balance = get_user_and_seller_balance(session, link.user_id)
+        is_seller = seller_balance is not None
         token_price = get_token_price(session)
         already_rewarded = has_subscription_reward(session, message.from_user.id)
     if not already_rewarded and not await is_subscribed(message.bot, message.from_user.id):
@@ -574,44 +645,48 @@ async def start(
         message.chat.id,
         "💚 <b>Emerald AI</b>\n\n"
         f"💎 Курс: <b>1 000 000 токенов = {format_rubles(token_price)} ₽</b>\n"
-        f"{balance_text(balance)}\n\n"
+        f"{balance_text(balance, seller_balance)}\n\n"
         "Выберите действие:",
+        is_seller=is_seller,
     )
 
 
 @router.message(Command("balance"))
 async def balance(message: Message, session_factory):
-    amount = read_balance(session_factory, message.from_user.id)
-    if amount is None:
+    user_bal, seller_bal = read_balance(session_factory, message.from_user.id)
+    if user_bal is None:
         await message.answer(
             "🔗 Сначала откройте бота по ссылке из кабинета Emerald AI.",
             reply_markup=main_menu_keyboard(),
         )
     else:
-        await message.answer(balance_text(amount), reply_markup=main_menu_keyboard())
+        is_seller = seller_bal is not None
+        await message.answer(balance_text(user_bal, seller_bal), reply_markup=main_menu_keyboard(is_seller=is_seller))
 
 
 @router.callback_query(F.data == "show:balance")
 async def show_balance(callback: CallbackQuery, session_factory):
     await callback.answer()
-    amount = read_balance(session_factory, callback.from_user.id)
+    user_bal, seller_bal = read_balance(session_factory, callback.from_user.id)
     if callback.message:
         text = "🔗 Сначала откройте покупку с сайта."
-        if amount is not None:
-            text = balance_text(amount)
-        await send_main_menu(callback.bot, callback.message.chat.id, text)
+        is_seller = seller_bal is not None
+        if user_bal is not None:
+            text = balance_text(user_bal, seller_bal)
+        await send_main_menu(callback.bot, callback.message.chat.id, text, is_seller=is_seller)
 
 
 @router.callback_query(F.data == "show:menu")
 async def show_main_menu(callback: CallbackQuery, state: FSMContext, session_factory):
     await callback.answer()
     await state.clear()
-    amount = read_balance(session_factory, callback.from_user.id)
+    user_bal, seller_bal = read_balance(session_factory, callback.from_user.id)
     if callback.message:
+        is_seller = seller_bal is not None
         text = "💚 <b>Emerald AI</b>\n\nВыберите действие:"
-        if amount is not None:
-            text = f"💚 <b>Emerald AI</b>\n\n{balance_text(amount)}\n\nВыберите действие:"
-        await send_main_menu(callback.bot, callback.message.chat.id, text)
+        if user_bal is not None:
+            text = f"💚 <b>Emerald AI</b>\n\n{balance_text(user_bal, seller_bal)}\n\nВыберите действие:"
+        await send_main_menu(callback.bot, callback.message.chat.id, text, is_seller=is_seller)
 
 
 @router.callback_query(F.data == "show:documents")
@@ -932,9 +1007,10 @@ async def issue_invoice(
     rub_amount: Decimal,
     session_factory,
     crypto: CryptoPayClient | None,
+    target_balance: str = "user",
 ):
     if crypto is None:
-        await message.answer("⚠️ Crypto Bot сейчас недоступен. Выберите СБП Платега.")
+        await message.answer("⚠️ Crypto Bot сейчас недоступен. Выберите другой способ оплаты.")
         return
     with session_factory() as session:
         link = get_bound_link(session, telegram_user_id)
@@ -942,8 +1018,13 @@ async def issue_invoice(
         await message.answer("🔗 Ссылка не привязана. Откройте покупку с сайта.")
         return
 
-    payload = f"em_{secrets.token_urlsafe(20)}"
+    payload = f"em_{target_balance}_{secrets.token_urlsafe(16)}"
     try:
+        desc = (
+            f"Пополнение баланса продавца: {format_tokens(token_amount)} токенов"
+            if target_balance == "seller"
+            else f"{format_tokens(token_amount)} токенов Emerald AI"
+        )
         invoice = await crypto.create_rub_invoice(rub_amount, token_amount, payload)
         payment_url = invoice_payment_url(invoice)
         if not payment_url:
@@ -960,6 +1041,7 @@ async def issue_invoice(
                 token_amount,
                 payload,
                 invoice,
+                target_balance=target_balance,
             )
     except CryptoPayError as error:
         logger.warning("Crypto Pay createInvoice failed: %s", error)
@@ -970,11 +1052,110 @@ async def issue_invoice(
         await message.answer("❌ Счёт создан некорректно. Попробуйте ещё раз через минуту.")
         return
 
+    target_title = "баланс продавца" if target_balance == "seller" else "ваш баланс"
     await message.answer(
-        f"🧾 <b>Счёт на {format_rubles(rub_amount)} ₽</b>\n"
-        f"💎 Будет начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n\n"
+        f"🧾 <b>Счёт на {format_rubles(rub_amount)} ₽</b> (Crypto Bot)\n"
+        f"💎 Будет начислено на {target_title}: <b>{format_tokens(payment.token_amount)}</b> токенов\n\n"
         "После оплаты нажмите «Проверить оплату».",
         reply_markup=payment_keyboard(payment_url, payment.id),
+    )
+
+
+async def issue_xrocket_invoice(
+    message: Message,
+    telegram_user_id: int,
+    token_amount: int,
+    rub_amount: Decimal,
+    session_factory,
+    xrocket: XRocketClient | None,
+    target_balance: str = "user",
+):
+    if xrocket is None:
+        await message.answer("⚠️ xRocket сейчас недоступен. Выберите другой способ.")
+        return
+    with session_factory() as session:
+        link = get_bound_link(session, telegram_user_id)
+    if link is None:
+        await message.answer("🔗 Ссылка не привязана. Откройте покупку с сайта.")
+        return
+
+    payload = f"em_xr_{target_balance}_{secrets.token_urlsafe(16)}"
+    desc = (
+        f"Пополнение баланса продавца: {format_tokens(token_amount)} токенов"
+        if target_balance == "seller"
+        else f"{format_tokens(token_amount)} токенов Emerald AI"
+    )
+    try:
+        data = await xrocket.create_rub_invoice(rub_amount, token_amount, payload, description=desc)
+        invoice_id = str(data.get("id") or data.get("invoiceId") or "")
+        payment_url = str(data.get("url") or data.get("botUrl") or data.get("link") or "")
+        if not payment_url and invoice_id:
+            payment_url = f"https://t.me/tonRocketBot?start=i_{invoice_id}"
+        with session_factory() as session:
+            current_link = get_bound_link(session, telegram_user_id)
+            if current_link is None:
+                raise RuntimeError("Purchase link was revoked")
+            payment = save_pending_xrocket_payment(
+                session,
+                current_link,
+                telegram_user_id,
+                rub_amount,
+                token_amount,
+                payload,
+                invoice_id,
+                payment_url=payment_url,
+                target_balance=target_balance,
+            )
+    except XRocketError as error:
+        logger.warning("XRocket create payment failed: %s", error)
+        await message.answer(f"❌ Ошибка xRocket: {html.escape(str(error))}")
+        return
+    except (RuntimeError, KeyError, ValueError, SQLAlchemyError):
+        logger.exception("Could not store XRocket transaction")
+        await message.answer("❌ Счёт создан некорректно. Попробуйте ещё раз.")
+        return
+
+    target_title = "баланс продавца" if target_balance == "seller" else "ваш баланс"
+    await message.answer(
+        f"🚀 <b>Счёт на {format_rubles(rub_amount)} ₽</b> (xRocket)\n"
+        f"💎 Будет начислено на {target_title}: <b>{format_tokens(payment.token_amount)}</b> токенов\n\n"
+        "Оплатите по ссылке ниже, затем бот автоматически зачислит токены:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Оплатить в xRocket", url=payment_url, style="success")],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check:xr:{payment.id}", style="primary")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="show:menu", style="primary")],
+        ]),
+    )
+
+
+async def issue_stars_invoice(
+    message: Message,
+    telegram_user_id: int,
+    token_amount: int,
+    rub_amount: Decimal,
+    session_factory,
+    target_balance: str = "user",
+):
+    with session_factory() as session:
+        link = get_bound_link(session, telegram_user_id)
+    if link is None:
+        await message.answer("🔗 Ссылка не привязана. Откройте покупку с сайта.")
+        return
+
+    # 1 Star = 1 RUB (1 к 1)
+    stars_amount = max(1, int(Decimal(rub_amount).quantize(Decimal("1"), rounding=ROUND_UP)))
+    payload = f"em_stars_{target_balance}_{secrets.token_urlsafe(16)}"
+    target_title = "баланс продавца" if target_balance == "seller" else "ваш баланс"
+    
+    from aiogram.types import LabeledPrice
+    prices = [LabeledPrice(label=f"{format_tokens(token_amount)} токенов", amount=stars_amount)]
+    await message.answer_invoice(
+        title=f"Покупка токенов Emerald AI",
+        description=f"{format_tokens(token_amount)} токенов на {target_title} (⭐️ {stars_amount} Stars)",
+        payload=payload,
+        currency="XTR",
+        prices=prices,
+        provider_token="",
     )
 
 
@@ -985,6 +1166,7 @@ async def issue_platega_invoice(
     rub_amount: Decimal,
     session_factory,
     platega: PlategaClient | None,
+    target_balance: str = "user",
 ):
     if platega is None:
         await message.answer("⚠️ СБП Платега сейчас недоступна. Выберите другой способ.")
@@ -996,7 +1178,7 @@ async def issue_platega_invoice(
         await message.answer("🔗 Ссылка не привязана. Откройте покупку с сайта.")
         return
 
-    payload = f"em_platega_{secrets.token_urlsafe(18)}"
+    payload = f"em_platega_{target_balance}_{secrets.token_urlsafe(16)}"
     try:
         transaction = await platega.create_payment_link(
             rub_amount,
@@ -1019,6 +1201,7 @@ async def issue_platega_invoice(
                 payload,
                 transaction,
                 PLATEGA_INVOICE_TTL_MINUTES,
+                target_balance=target_balance,
             )
     except PlategaError as error:
         logger.warning("Platega create payment failed: %s", error)
@@ -1036,9 +1219,10 @@ async def issue_platega_invoice(
             payment.transaction_id,
             provider_ttl,
         )
+    target_title = "баланс продавца" if target_balance == "seller" else "ваш баланс"
     await message.answer(
         f"🏦 <b>Счёт СБП Платега на {format_rubles(rub_amount)} ₽</b>\n"
-        f"💎 Будет начислено: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
+        f"💎 Будет начислено на {target_title}: <b>{format_tokens(payment.token_amount)}</b> токенов\n"
         f"⏱ Срок действия: <b>{PLATEGA_INVOICE_TTL_MINUTES} минут</b>\n\n"
         "На странице оплаты выберите удобный способ. После успешной оплаты "
         "токены зачислятся автоматически — или нажмите кнопку «Проверить оплату».",
@@ -1053,13 +1237,30 @@ async def offer_payment_methods(
     rub_amount: Decimal,
     crypto: CryptoPayClient | None,
     platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
+    target_balance: str = "user",
 ):
-    await state.set_state(PurchaseState.choosing_payment_method)
-    await state.update_data(token_amount=token_amount, rub_amount=str(rub_amount))
+    if target_balance == "seller":
+        await state.set_state(PurchaseState.choosing_seller_payment_method)
+    else:
+        await state.set_state(PurchaseState.choosing_payment_method)
+    await state.update_data(
+        token_amount=token_amount,
+        rub_amount=str(rub_amount),
+        target_balance=target_balance,
+    )
+    title = "💼 Пополнение баланса продавца" if target_balance == "seller" else "💎 Покупка токенов"
     await message.answer(
-        f"💎 <b>{format_tokens(token_amount)}</b> токенов · <b>{format_rubles(rub_amount)} ₽</b>\n\n"
+        f"{title}\n\n"
+        f"<b>{format_tokens(token_amount)}</b> токенов · <b>{format_rubles(rub_amount)} ₽</b>\n\n"
         "Выберите способ оплаты:",
-        reply_markup=payment_method_keyboard(crypto is not None, platega is not None),
+        reply_markup=payment_method_keyboard(
+            crypto_available=crypto is not None,
+            platega_available=platega is not None,
+            xrocket_available=xrocket is not None,
+            stars_available=True,
+            target_balance=target_balance,
+        ),
     )
 
 
@@ -1070,6 +1271,7 @@ async def create_package_invoice(
     session_factory,
     crypto: CryptoPayClient | None,
     platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
 ):
     if callback.data == "buy:custom":
         return
@@ -1089,6 +1291,8 @@ async def create_package_invoice(
             tokens_to_rubles(token_amount, token_price),
             crypto,
             platega,
+            xrocket,
+            target_balance="user",
         )
 
 
@@ -1099,6 +1303,7 @@ async def create_custom_invoice(
     session_factory,
     crypto: CryptoPayClient | None,
     platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
 ):
     raw_value = (message.text or "").strip()
     if not re.fullmatch(r"[0-9 _]+", raw_value):
@@ -1116,21 +1321,125 @@ async def create_custom_invoice(
     await message.answer(
         f"🧮 Рассчитано: <b>{format_tokens(token_amount)}</b> токенов = <b>{format_rubles(rub_amount)} ₽</b>"
     )
-    await offer_payment_methods(message, state, token_amount, rub_amount, crypto, platega)
+    await offer_payment_methods(message, state, token_amount, rub_amount, crypto, platega, xrocket, target_balance="user")
 
 
-@router.callback_query(PurchaseState.choosing_payment_method, F.data.startswith("method:"))
+@router.callback_query(F.data == "show:seller_packages")
+async def show_seller_packages(callback: CallbackQuery, state: FSMContext, session_factory):
+    await state.clear()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        if link is None or not is_seller_user(session, link.user_id):
+            await callback.answer("У вас нет доступа к балансу продавца", show_alert=True)
+            return
+        token_price = get_token_price(session)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "💼 <b>Пополнение баланса продавца со скидкой до 50%</b>\n\n" "Сетка оптовых скидок:\n" "• 500M токенов — <b>скидка 5%</b>\n" "• 1 000M (1B) — <b>скидка 10%</b>\n" "• 2 000M (2B) — <b>скидка 20%</b>\n" "• 3 000M (3B) — <b>скидка 30%</b>\n" "• 4 000M (4B) — <b>скидка 40%</b>\n" "• 5 000M+ (5B+) — <b>скидка 50% (макс.)</b>\n\n" f"Базовый курс: 1 000 000 = {format_rubles(token_price)} ₽\n" "Выберите готовый пакет или введите своё количество:",
+            reply_markup=seller_package_keyboard(token_price),
+        )
+
+
+@router.callback_query(F.data == "seller_buy:custom")
+async def request_custom_seller_amount(callback: CallbackQuery, state: FSMContext, session_factory):
+    await callback.answer()
+    with session_factory() as session:
+        link = get_bound_link(session, callback.from_user.id)
+        if link is None or not is_seller_user(session, link.user_id):
+            await callback.answer("У вас нет доступа к балансу продавца", show_alert=True)
+            return
+    await state.set_state(PurchaseState.waiting_for_seller_token_amount)
+    if callback.message:
+        await callback.message.answer(
+            "✍️ <b>Введите количество токенов для баланса продавца</b>\n\n" "Скидка рассчитается автоматически (от 5% при 500M до 50% при 5B+).\n" "Например: <code>1000000000</code>\n\n" "Для отмены отправьте /cancel"
+        )
+
+
+@router.message(PurchaseState.waiting_for_seller_token_amount)
+async def create_custom_seller_invoice(
+    message: Message,
+    state: FSMContext,
+    session_factory,
+    crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
+):
+    raw_value = (message.text or "").strip()
+    if not re.fullmatch(r"[0-9 _]+", raw_value):
+        await message.answer("⚠️ Введите целое число, например: <code>1000000000</code>")
+        return
+    token_amount = int(raw_value.replace(" ", "").replace("_", ""))
+    if token_amount < 1_000_000:
+        await message.answer("⚠️ Минимум — <b>1 000 000</b> токенов.")
+        return
+    token_price = read_token_price(session_factory)
+    rub_amount, discount, saved = seller_tokens_to_rubles(token_amount, token_price)
+    disc_text = f" (скидка <b>{discount}%</b>, экономия {format_rubles(saved)} ₽)" if discount > 0 else ""
+    await message.answer(
+        f"🧮 Рассчитано: <b>{format_tokens(token_amount)}</b> токенов = <b>{format_rubles(rub_amount)} ₽</b>{disc_text}"
+    )
+    await offer_payment_methods(
+        message,
+        state,
+        token_amount,
+        rub_amount,
+        crypto,
+        platega,
+        xrocket,
+        target_balance="seller",
+    )
+
+
+@router.callback_query(F.data.startswith("seller_buy:"))
+async def create_seller_package_invoice(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory,
+    crypto: CryptoPayClient | None,
+    platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
+):
+    if callback.data == "seller_buy:custom":
+        return
+    try:
+        package_id = int(callback.data.split(":", 1)[1])
+        token_amount = SELLER_PACKAGES[package_id]
+    except (ValueError, IndexError, KeyError, AttributeError):
+        await callback.answer("❌ Некорректный пакет", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        token_price = read_token_price(session_factory)
+        rub_amount, discount, saved = seller_tokens_to_rubles(token_amount, token_price)
+        await offer_payment_methods(
+            callback.message,
+            state,
+            token_amount,
+            rub_amount,
+            crypto,
+            platega,
+            xrocket,
+            target_balance="seller",
+        )
+
+
+@router.callback_query(
+    F.data.startswith("method:") | F.data.startswith("seller_method:")
+)
 async def choose_payment_method(
     callback: CallbackQuery,
     state: FSMContext,
     session_factory,
     crypto: CryptoPayClient | None,
     platega: PlategaClient | None,
+    xrocket: XRocketClient | None = None,
 ):
     data = await state.get_data()
     try:
         token_amount = int(data["token_amount"])
         rub_amount = Decimal(data["rub_amount"])
+        target_balance = str(data.get("target_balance") or "user")
     except (KeyError, ValueError):
         await state.clear()
         await callback.answer("Сумма устарела. Выберите пакет заново.", show_alert=True)
@@ -1149,13 +1458,36 @@ async def choose_payment_method(
             rub_amount,
             session_factory,
             crypto,
+            target_balance=target_balance,
         )
         return
-    # Keep the old callback as a compatibility alias for payment-choice messages
-    # that Telegram users may still have open. Both values create only a Platega
-    # checkout; the removed manual SBP flow cannot be reached.
+    if method == "xrocket":
+        await callback.answer("⏳ Создаю счёт xRocket…")
+        await state.clear()
+        await issue_xrocket_invoice(
+            callback.message,
+            callback.from_user.id,
+            token_amount,
+            rub_amount,
+            session_factory,
+            xrocket,
+            target_balance=target_balance,
+        )
+        return
+    if method == "stars":
+        await callback.answer("⭐️ Выставляю Telegram Stars…")
+        await state.clear()
+        await issue_stars_invoice(
+            callback.message,
+            callback.from_user.id,
+            token_amount,
+            rub_amount,
+            session_factory,
+            target_balance=target_balance,
+        )
+        return
     if method not in {"platega", "sbp"}:
-        await callback.answer("Неизвестный спос��б оплаты", show_alert=True)
+        await callback.answer("Неизвестный способ оплаты", show_alert=True)
         return
     await callback.answer("⏳ Создаю счёт…")
     await state.clear()
@@ -1166,6 +1498,7 @@ async def choose_payment_method(
         rub_amount,
         session_factory,
         platega,
+        target_balance=target_balance,
     )
 
 
@@ -2046,6 +2379,61 @@ async def check_platega_payment(callback: CallbackQuery, session_factory, plateg
     else:
         logger.warning("Platega verification mismatch for payment %s", payment_id)
         await callback.message.answer("⚠️ Данные счёта не совпали. Баланс не изменён.")
+
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query):
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, session_factory):
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+    # payload format: em_stars_{target_balance}_{token}
+    target_balance = "user"
+    if "_seller_" in payload:
+        target_balance = "seller"
+
+    with session_factory() as session:
+        link = get_bound_link(session, message.from_user.id)
+        if link is None:
+            await message.answer("❌ Ошибка: аккаунт не привязан.")
+            return
+        token_price = get_token_price(session)
+        # stars: 1 star = 1 RUB
+        rub_amount = Decimal(sp.total_amount)
+        if target_balance == "seller":
+            # calculate tokens from rub_amount with seller discount if applicable
+            token_amount = int((rub_amount / token_price) * 1_000_000)
+            # if wholesale, give extra tokens for the same rub amount
+            disc = seller_discount_percent(token_amount)
+            if disc > 0 and disc < 100:
+                token_amount = int(Decimal(token_amount) / (Decimal(100 - disc) / Decimal(100)))
+        else:
+            token_amount = int((rub_amount / token_price) * 1_000_000)
+
+        res, payment = credit_stars_payment(
+            session,
+            link,
+            message.from_user.id,
+            sp.telegram_payment_charge_id,
+            payload,
+            sp.total_amount,
+            token_amount,
+            target_balance=target_balance,
+        )
+        user_bal, seller_bal = get_user_and_seller_balance(session, link.user_id)
+
+    target_title = "баланс продавца" if target_balance == "seller" else "ваш баланс"
+    is_seller = seller_bal is not None
+    await message.answer(
+        "⭐️ <b>Оплата Telegram Stars успешна!</b>\n\n"
+        f"💎 Начислено на {target_title}: <b>{format_tokens(token_amount)}</b> токенов\n"
+        f"{balance_text(user_bal, seller_bal)}",
+        reply_markup=main_menu_keyboard(is_seller=is_seller),
+    )
 
 
 @router.callback_query(F.data.startswith("check:"))

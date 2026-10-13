@@ -30,24 +30,11 @@ def apply(core) -> None:
         state,
         token_amount: int,
         rub_amount: Decimal,
-        crypto,
-        platega,
+        crypto=None,
+        platega=None,
+        xrocket=None,
+        target_balance: str = "user",
     ):
-        if crypto is None and platega is None:
-            await state.clear()
-            await message.answer(
-                "⚠️ <b>Оплата временно недоступна</b>\n\n"
-                "Сейчас ни один платёжный способ не подключён. "
-                "Попробуйте позже или обратитесь в поддержку.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="⬅️ Главное меню",
-                        callback_data="show:menu",
-                        style="primary",
-                    )
-                ]]),
-            )
-            return
         await original_offer_payment_methods(
             message,
             state,
@@ -55,6 +42,8 @@ def apply(core) -> None:
             rub_amount,
             crypto,
             platega,
+            xrocket,
+            target_balance=target_balance,
         )
 
     core.offer_payment_methods = offer_payment_methods

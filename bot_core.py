@@ -2796,6 +2796,10 @@ async def main():
         logger.warning("CRYPTOBOT_TOKEN is not configured; Crypto Bot payments are unavailable")
     if platega is None:
         logger.warning("Platega credentials are not configured; Platega payments are unavailable")
+    xrocket_api_key = os.getenv("XROCKET_API_KEY", "").strip()
+    xrocket = XRocketClient(xrocket_api_key) if xrocket_api_key else None
+    if xrocket is None:
+        logger.warning("XROCKET_API_KEY is not configured; xRocket payments are unavailable")
 
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
@@ -2816,6 +2820,7 @@ async def main():
             session_factory=session_factory,
             crypto=crypto,
             platega=platega,
+            xrocket=xrocket,
             admin_id=admin_id,
             allowed_updates=dispatcher.resolve_used_update_types(),
             close_bot_session=False,
@@ -2828,6 +2833,8 @@ async def main():
             await crypto.close()
         if platega is not None:
             await platega.close()
+        if xrocket is not None:
+            await xrocket.close()
         await bot.session.close()
         engine.dispose()
 
